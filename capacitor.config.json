@@ -1,0 +1,9 @@
+{
+  "appId": "com.couples.chatapp",
+  "appName": "ChatApp ♡",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  }
+}
+

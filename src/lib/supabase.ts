@@ -46,7 +46,7 @@ export function getSupabaseClient(): SupabaseClient | null {
 
 export async function uploadMediaToStorage(
   fileOrBlob: File | Blob,
-  folder: 'stickers' | 'wallpapers' | 'voice' | 'images',
+  folder: 'stickers' | 'wallpapers' | 'voice' | 'images' | 'videos',
   ext = 'webp'
 ): Promise<string | null> {
   const supabase = getSupabaseClient();
@@ -58,7 +58,8 @@ export async function uploadMediaToStorage(
       .from('chat-media')
       .upload(fileName, fileOrBlob, {
         cacheControl: '3600',
-        upsert: false
+        upsert: false,
+        contentType: fileOrBlob.type || undefined
       });
 
     if (error || !data) {

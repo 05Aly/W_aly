@@ -221,6 +221,12 @@ export default function App() {
   const [isPartnerTyping, setIsPartnerTyping] = useState(false);
   const [soundEnabled] = useState(true);
   const [activeCallModal, setActiveCallModal] = useState<string | null>(null);
+  const [pastedMedia, setPastedMedia] = useState<{
+    file: File;
+    previewUrl: string;
+    isVideo: boolean;
+  } | null>(null);
+  const [lightboxImageUrl, setLightboxImageUrl] = useState<string | null>(null);
 
   // Voice Note Recorder State
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
@@ -281,8 +287,10 @@ export default function App() {
           snippet:
             parent.type === 'text'
               ? parent.content
-              : parent.type === 'sticker'
-              ? '🖼️ ملصق خاص'
+              : parent.type === 'video'
+              ? '🎥 مقطع فيديو'
+              : parent.type === 'sticker' || parent.type === 'image'
+              ? '🖼️ صورة / ملصق'
               : '🎤 رسالة صوتية'
         };
       }
@@ -302,14 +310,17 @@ export default function App() {
       }
     }
 
+    const normalizedType = row.type === 'image' ? 'sticker' : row.type || 'text';
+
     return {
       id: row.id,
       senderId,
-      type: row.type || 'text',
-      text: row.type === 'text' ? row.content : undefined,
-      stickerUrl: row.type === 'sticker' ? row.content : undefined,
-      audioDataUrl: row.type === 'voice' ? audioDataUrl : undefined,
-      voiceDuration: row.type === 'voice' ? voiceDuration : undefined,
+      type: normalizedType,
+      text: normalizedType === 'text' ? row.content : undefined,
+      stickerUrl: normalizedType === 'sticker' ? row.content : undefined,
+      videoUrl: normalizedType === 'video' ? row.content : undefined,
+      audioDataUrl: normalizedType === 'voice' ? audioDataUrl : undefined,
+      voiceDuration: normalizedType === 'voice' ? voiceDuration : undefined,
       time: formatTimeFromISO(row.created_at),
       timestamp: row.created_at ? new Date(row.created_at).getTime() : Date.now(),
       status: row.is_read ? 'read' : 'sent',
@@ -414,7 +425,12 @@ export default function App() {
 
       if (msgsData) {
         const mapped = msgsData.map((r: any) => mapDbMessageToUi(r, msgsData, updatedProfiles));
-        setMessages(mapped);
+        setMessages((prev) => {
+          const pendingUploads = prev.filter(
+            (m) => m.isUploading && !mapped.some((dbMsg: any) => dbMsg.id === m.id)
+          );
+          return [...mapped, ...pendingUploads];
+        });
       }
     } catch (err: any) {
       console.warn('Supabase fetch error:', err);
@@ -728,9 +744,195 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
+  // Instant Optimistic Image & Video Sender (0ms UI latency)
+  const handleSendMediaFile = useCallback(
+    async (file: File) => {
+      if (!loggedInUserId || !file) return;
+      const isVideo = file.type.startsWith('video/');
+      const isImage = file.type.startsWith('image/');
+      if (!isVideo && !isImage) return;
+
+      const supabase = getSupabaseClient();
+      const myUsername = ID_TO_USERNAME[loggedInUserId];
+      const msgId =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      // Create instant 0ms local preview URL
+      const localPreviewUrl = URL.createObjectURL(file);
+      const replyIdForDb =
+        replyingTo?.id && !String(replyingTo.id).startsWith('msg-') ? replyingTo.id : null;
+
+      const optimisticMsg = {
+        id: msgId,
+        senderId: loggedInUserId,
+        type: isVideo ? 'video' : 'sticker',
+        stickerUrl: isImage ? localPreviewUrl : undefined,
+        videoUrl: isVideo ? localPreviewUrl : undefined,
+        isUploading: true,
+        time: formatTimeFromISO(),
+        timestamp: Date.now(),
+        status: 'sent',
+        reactions: [],
+        replyTo: replyingTo
+          ? {
+              id: replyingTo.id,
+              senderId: replyingTo.senderId,
+              senderName: profiles[replyingTo.senderId]?.name,
+              snippet:
+                replyingTo.text ||
+                (replyingTo.type === 'video'
+                  ? '🎥 مقطع فيديو'
+                  : replyingTo.type === 'sticker'
+                  ? '🖼️ صورة / ملصق'
+                  : '🎤 رسالة صوتية')
+            }
+          : null
+      };
+
+      setMessages((prev) => {
+        const next = [...prev, optimisticMsg];
+        broadcastUpdate('SYNC_MESSAGES', next);
+        return next;
+      });
+      setReplyingTo(null);
+      setPastedMedia(null);
+      setShowEmojiPicker(false);
+      setShowStickerPicker(false);
+      playSound('send');
+
+      if (isVideo) {
+        // Upload video directly to Supabase Storage
+        const ext = file.name.split('.').pop()?.toLowerCase() || 'mp4';
+        let finalVideoUrl = localPreviewUrl;
+        const uploadedUrl = await uploadMediaToStorage(file, 'videos', ext);
+        if (uploadedUrl) {
+          finalVideoUrl = uploadedUrl;
+        }
+
+        setMessages((prev) => {
+          const next = prev.map((m) =>
+            m.id === msgId ? { ...m, videoUrl: finalVideoUrl, isUploading: false } : m
+          );
+          broadcastUpdate('SYNC_MESSAGES', next);
+          return next;
+        });
+
+        if (supabase && dbConnected) {
+          await supabase.from('messages').insert({
+            id: msgId.startsWith('msg-') ? undefined : msgId,
+            sender: myUsername,
+            type: 'video',
+            content: finalVideoUrl,
+            reply_to_id: replyIdForDb,
+            reactions: [],
+            is_edited: false,
+            is_read: false
+          });
+        }
+      } else {
+        // Compress image fast & upload in background
+        processImageFile(file, 900, async (compressedDataUrl, blob) => {
+          let finalImageUrl = compressedDataUrl;
+          if (blob) {
+            const uploadedUrl = await uploadMediaToStorage(blob, 'images', 'webp');
+            if (uploadedUrl) {
+              finalImageUrl = uploadedUrl;
+            }
+          }
+
+          setMessages((prev) => {
+            const next = prev.map((m) =>
+              m.id === msgId ? { ...m, stickerUrl: finalImageUrl, isUploading: false } : m
+            );
+            broadcastUpdate('SYNC_MESSAGES', next);
+            return next;
+          });
+
+          if (supabase && dbConnected) {
+            await supabase.from('messages').insert({
+              id: msgId.startsWith('msg-') ? undefined : msgId,
+              sender: myUsername,
+              type: 'sticker',
+              content: finalImageUrl,
+              reply_to_id: replyIdForDb,
+              reactions: [],
+              is_edited: false,
+              is_read: false
+            });
+          }
+        });
+      }
+    },
+    [loggedInUserId, replyingTo, profiles, dbConnected, playSound]
+  );
+
+  // Handle Clipboard Paste (Ctrl+V / Mobile Paste for Images & Videos)
+  const handleClipboardPaste = useCallback(
+    (e: React.ClipboardEvent | ClipboardEvent) => {
+      if (!loggedInUserId) return;
+      const clipboardData = (e as React.ClipboardEvent).clipboardData || (e as ClipboardEvent).clipboardData;
+      if (!clipboardData) return;
+
+      const items = clipboardData.items;
+      if (items) {
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          if (item.type.startsWith('image/') || item.type.startsWith('video/')) {
+            const file = item.getAsFile();
+            if (file) {
+              e.preventDefault();
+              const previewUrl = URL.createObjectURL(file);
+              setPastedMedia({
+                file,
+                previewUrl,
+                isVideo: file.type.startsWith('video/')
+              });
+              return;
+            }
+          }
+        }
+      }
+
+      if (clipboardData.files && clipboardData.files.length > 0) {
+        const file = clipboardData.files[0];
+        if (file.type.startsWith('image/') || file.type.startsWith('video/')) {
+          e.preventDefault();
+          const previewUrl = URL.createObjectURL(file);
+          setPastedMedia({
+            file,
+            previewUrl,
+            isVideo: file.type.startsWith('video/')
+          });
+        }
+      }
+    },
+    [loggedInUserId]
+  );
+
+  // Global Paste listener so Ctrl+V works anywhere in the chat window
+  useEffect(() => {
+    if (!loggedInUserId || activeNav !== 'chat') return;
+    const onGlobalPaste = (e: ClipboardEvent) => {
+      handleClipboardPaste(e);
+    };
+    window.addEventListener('paste', onGlobalPaste);
+    return () => window.removeEventListener('paste', onGlobalPaste);
+  }, [loggedInUserId, activeNav, handleClipboardPaste]);
+
   // Send or Edit Message
   const handleSendMessage = async (content: string, type = 'text', extra: any = {}) => {
     if (!loggedInUserId) return;
+
+    // If there is a pasted image/video in the preview bar and user clicks Send / presses Enter
+    if (type === 'text' && pastedMedia) {
+      const mediaToSend = pastedMedia;
+      setPastedMedia(null);
+      await handleSendMediaFile(mediaToSend.file);
+      if (!content || !content.trim()) return;
+    }
+
     if (type === 'text' && (!content || !content.trim())) return;
 
     const supabase = getSupabaseClient();
@@ -770,7 +972,7 @@ export default function App() {
       ...extra,
       time: formatTimeFromISO(),
       timestamp: Date.now(),
-      status: 'read',
+      status: 'sent',
       reactions: [],
       replyTo: replyingTo
         ? {
@@ -779,7 +981,11 @@ export default function App() {
             senderName: profiles[replyingTo.senderId]?.name,
             snippet:
               replyingTo.text ||
-              (replyingTo.type === 'sticker' ? '🖼️ ملصق خاص' : '🎤 رسالة صوتية')
+              (replyingTo.type === 'video'
+                ? '🎥 مقطع فيديو'
+                : replyingTo.type === 'sticker'
+                ? '🖼️ صورة / ملصق'
+                : '🎤 رسالة صوتية')
           }
         : null
     };
@@ -802,6 +1008,8 @@ export default function App() {
       let dbContent = content.trim();
       if (type === 'sticker') {
         dbContent = extra.stickerUrl || '';
+      } else if (type === 'video') {
+        dbContent = extra.videoUrl || '';
       } else if (type === 'voice') {
         dbContent = JSON.stringify({
           duration: extra.voiceDuration || 3,
@@ -1388,7 +1596,11 @@ export default function App() {
                       </span>
                     ) : lastMessage ? (
                       lastMessage.text ||
-                      (lastMessage.type === 'sticker' ? 'ملصق حب ❤️' : 'رسالة صوتية 🎤')
+                      (lastMessage.type === 'video'
+                        ? 'مقطع فيديو 🎥'
+                        : lastMessage.type === 'sticker'
+                        ? 'صورة / ملصق ❤️'
+                        : 'رسالة صوتية 🎤')
                     ) : (
                       'ابدأ أول رسالة حب بينكما ❤️'
                     )}
@@ -1752,6 +1964,16 @@ export default function App() {
                   setShowStickerPicker(false);
                   setShowMoodDropdown(false);
                 }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const file = e.dataTransfer?.files?.[0];
+                  if (file && (file.type.startsWith('image/') || file.type.startsWith('video/'))) {
+                    handleSendMediaFile(file);
+                  }
+                }}
                 className="flex-1 overflow-y-auto px-4 md:px-8 py-5 space-y-3 relative"
               >
                 {messages.length === 0 && (
@@ -1811,12 +2033,88 @@ export default function App() {
                           >
                             <img
                               src={msg.stickerUrl}
-                              alt="Sticker"
-                              className="w-36 h-36 sm:w-40 sm:h-40 object-contain rounded-2xl drop-shadow-md transition-transform group-hover:scale-102"
+                              alt="Sent media"
+                              onClick={(e) => {
+                                if (e.detail === 1 && !isSelected) {
+                                  // Single click selects action menu; button in corner opens full view
+                                }
+                              }}
+                              className="max-w-[230px] sm:max-w-[280px] max-h-72 w-auto h-auto object-cover rounded-2xl drop-shadow-md border border-rose-200/50 dark:border-slate-700/60 transition-transform group-hover:scale-[1.01]"
                             />
-                            <span className="absolute bottom-1 right-1 px-2.5 py-0.5 rounded-full bg-slate-800/75 text-white text-[10px] font-medium backdrop-blur-xs">
-                              {msg.time}
+                            {msg.isUploading && (
+                              <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
+                                جاري الرفع... ⚡
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setLightboxImageUrl(msg.stickerUrl);
+                              }}
+                              className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-slate-900/65 text-white text-[10px] opacity-0 group-hover:opacity-100 transition cursor-pointer"
+                              title="تكبير الصورة"
+                            >
+                              تكبير 🔍
+                            </button>
+                            <span className="absolute bottom-1.5 right-1.5 px-2.5 py-0.5 rounded-full bg-slate-900/75 text-white text-[10px] font-medium backdrop-blur-xs flex items-center gap-1">
+                              <span>{msg.time}</span>
+                              {isMe && (
+                                msg.status === 'read' ? (
+                                  <CheckCheck className="w-3 h-3 text-white stroke-[2.2]" />
+                                ) : (
+                                  <Check className="w-3 h-3 text-white/80 stroke-[2]" />
+                                )
+                              )}
                             </span>
+                          </div>
+                        ) : msg.type === 'video' ? (
+                          <div
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActiveMessageActionId(isSelected ? null : msg.id);
+                            }}
+                            onDoubleClick={(e) => {
+                              e.stopPropagation();
+                              handleToggleReaction(msg.id, '❤️');
+                            }}
+                            className={`relative p-1.5 rounded-2xl shadow-md cursor-pointer ${
+                              isMe
+                                ? 'bg-[#C8102E] text-white rounded-br-xs'
+                                : 'bg-white dark:bg-[#1E2738] text-slate-900 dark:text-slate-100 rounded-bl-xs border border-rose-100/70 dark:border-slate-700/60'
+                            }`}
+                          >
+                            <div className="relative rounded-xl overflow-hidden bg-black">
+                              <video
+                                src={msg.videoUrl}
+                                controls
+                                playsInline
+                                preload="metadata"
+                                onClick={(e) => e.stopPropagation()}
+                                className="w-64 sm:w-80 max-h-80 object-contain rounded-xl bg-black"
+                              />
+                              {msg.isUploading && (
+                                <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
+                                  جاري رفع الفيديو... ⚡
+                                </span>
+                              )}
+                            </div>
+                            <div
+                              className={`flex items-center justify-end gap-1 px-2 pt-1 text-[10px] ${
+                                isMe ? 'text-rose-100' : 'text-slate-400'
+                              }`}
+                            >
+                              <span>🎥 فيديو</span>
+                              <span>•</span>
+                              <span>{msg.time}</span>
+                              {isMe && (
+                                msg.status === 'read' ? (
+                                  <CheckCheck className="w-3.5 h-3.5 text-white stroke-[2.2]" />
+                                ) : (
+                                  <Check className="w-3.5 h-3.5 text-white/80 stroke-[2]" />
+                                )
+                              )}
+                            </div>
                           </div>
                         ) : (
                           <div
@@ -2134,6 +2432,53 @@ export default function App() {
                 </div>
               )}
 
+              {/* Pasted Image / Video Instant Preview Banner (Ctrl+V) */}
+              {pastedMedia && (
+                <div className="px-4 py-2.5 bg-rose-50/95 dark:bg-[#161F33] border-t border-rose-200 dark:border-slate-700 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    {pastedMedia.isVideo ? (
+                      <video
+                        src={pastedMedia.previewUrl}
+                        className="w-14 h-14 rounded-xl object-cover border border-[#C8102E]/40 bg-black shrink-0"
+                        muted
+                      />
+                    ) : (
+                      <img
+                        src={pastedMedia.previewUrl}
+                        alt="Pasted preview"
+                        className="w-14 h-14 rounded-xl object-cover border border-[#C8102E]/40 shrink-0 shadow-xs"
+                      />
+                    )}
+                    <div className="min-w-0">
+                      <span className="text-xs font-bold text-[#C8102E] dark:text-rose-400 block">
+                        {pastedMedia.isVideo ? '🎥 فيديو جاهز للإرسال' : '🖼️ صورة من الحافظة (Paste) جاهزة للإرسال'}
+                      </span>
+                      <span className="text-[11px] text-slate-500 dark:text-slate-300 truncate block">
+                        اضغط Enter أو زر الإرسال لإرسالها بسرعة فائقة ⚡
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => handleSendMediaFile(pastedMedia.file)}
+                      className="px-3.5 py-1.5 rounded-xl bg-[#C8102E] hover:bg-[#a80d26] text-white text-xs font-bold shadow-xs cursor-pointer flex items-center gap-1"
+                    >
+                      <Send className="w-3.5 h-3.5 fill-white" />
+                      <span>إرسال الآن</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPastedMedia(null)}
+                      className="p-1.5 rounded-full text-slate-500 hover:bg-rose-200/50 dark:hover:bg-slate-700 cursor-pointer"
+                      title="إلغاء"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Message Composer Bar */}
               <div className="px-3 sm:px-6 py-2.5 bg-[#FDF8F8] dark:bg-[#0B1120] border-t border-rose-100 dark:border-slate-800/80 shrink-0">
                 <div className="flex items-center gap-2.5">
@@ -2183,10 +2528,11 @@ export default function App() {
                         type="text"
                         value={inputText}
                         onChange={(e) => handleInputChange(e.target.value)}
+                        onPaste={handleClipboardPaste}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter') handleSendMessage(inputText, 'text');
                         }}
-                        placeholder="Type a message..."
+                        placeholder="اكتب رسالة أو الصق صورة (Ctrl+V)..."
                         className="flex-1 bg-transparent text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
                       />
 
@@ -2203,7 +2549,7 @@ export default function App() {
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
                         className="text-slate-500 dark:text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
-                        title="إرفاق صورة"
+                        title="إرفاق صورة أو فيديو"
                       >
                         <Paperclip className="w-5 h-5" />
                       </button>
@@ -2212,16 +2558,12 @@ export default function App() {
                         ref={fileInputRef}
                         onChange={(e) => {
                           const file = e.target.files?.[0];
-                          processImageFile(file, 600, async (dataUrl, blob) => {
-                            let finalUrl = dataUrl;
-                            if (blob) {
-                              const uploaded = await uploadMediaToStorage(blob, 'images', 'webp');
-                              if (uploaded) finalUrl = uploaded;
-                            }
-                            handleSendMessage('', 'sticker', { stickerUrl: finalUrl });
-                          });
+                          if (file) {
+                            handleSendMediaFile(file);
+                          }
+                          e.target.value = '';
                         }}
-                        accept="image/*"
+                        accept="image/*,video/*"
                         className="hidden"
                       />
 
@@ -2425,6 +2767,26 @@ export default function App() {
               <Phone className="w-6 h-6 rotate-135" />
             </button>
           </div>
+        </div>
+      )}
+      {/* MODAL 3: IMAGE LIGHTBOX ZOOM */}
+      {lightboxImageUrl && (
+        <div
+          onClick={() => setLightboxImageUrl(null)}
+          className="fixed inset-0 z-50 bg-black/90 backdrop-blur-xs flex items-center justify-center p-4"
+        >
+          <button
+            onClick={() => setLightboxImageUrl(null)}
+            className="absolute top-5 right-5 p-2.5 rounded-full bg-white/15 hover:bg-white/25 text-white cursor-pointer"
+          >
+            <X className="w-6 h-6" />
+          </button>
+          <img
+            src={lightboxImageUrl}
+            alt="Full view"
+            onClick={(e) => e.stopPropagation()}
+            className="max-w-full max-h-[90vh] object-contain rounded-2xl shadow-2xl"
+          />
         </div>
       )}
     </div>

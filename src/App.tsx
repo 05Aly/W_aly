@@ -166,7 +166,7 @@ function getMessageDateGroup(timestamp?: number): string {
 }
 
 // Telegram & WhatsApp Rich Text Formatter with Telegram Spoilers & Search Highlight
-function FormattedMessageText({
+const FormattedMessageText = React.memo(function FormattedMessageText({
   text,
   searchQuery
 }: {
@@ -256,7 +256,7 @@ function FormattedMessageText({
       })}
     </span>
   );
-}
+});
 
 export default function App() {
   // 1. PERSISTENT SINGLE-ACCOUNT AUTHENTICATION STATE
@@ -461,6 +461,24 @@ export default function App() {
   // I. Shared Media Gallery Modal
   const [showSharedMediaModal, setShowSharedMediaModal] = useState(false);
   const [sharedMediaTab, setSharedMediaTab] = useState<'media' | 'voice' | 'stickers'>('media');
+
+  // Stable Refs for Zero-Lag Performance & Notification Deduplication
+  const profilesRef = useRef(profiles);
+  useEffect(() => {
+    profilesRef.current = profiles;
+  }, [profiles]);
+
+  const notifiedMsgIdsRef = useRef<Set<string>>(new Set());
+  const isCurrentlyTypingRef = useRef(false);
+
+  // Pre-seed notified IDs so existing historical messages never trigger alerts
+  useEffect(() => {
+    if (messages.length > 0) {
+      messages.forEach((m) => {
+        if (m.id) notifiedMsgIdsRef.current.add(m.id);
+      });
+    }
+  }, [messages.length]);
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -776,8 +794,16 @@ export default function App() {
             }
           }
         });
-        setProfiles(updatedProfiles);
-        setPartnerMoods(updatedMoods);
+        setProfiles((prev) => {
+          const prevJson = JSON.stringify(prev);
+          const nextJson = JSON.stringify(updatedProfiles);
+          return prevJson === nextJson ? prev : updatedProfiles;
+        });
+        setPartnerMoods((prev) => {
+          const prevJson = JSON.stringify(prev);
+          const nextJson = JSON.stringify(updatedMoods);
+          return prevJson === nextJson ? prev : updatedMoods;
+        });
       }
 
       // 2. Fetch chat_settings
@@ -820,6 +846,9 @@ export default function App() {
         .order('created_at', { ascending: true });
 
       if (msgsData) {
+        msgsData.forEach((r: any) => {
+          if (r.id) notifiedMsgIdsRef.current.add(r.id);
+        });
         const mapped = msgsData.map((r: any) => mapDbMessageToUi(r, msgsData, updatedProfiles));
         setMessages((prev) => {
           const pendingUploads = prev.filter(
@@ -857,26 +886,29 @@ export default function App() {
           { event: '*', schema: 'public', table: 'messages' },
           (payload: any) => {
             fetchSupabaseData();
-            playSound('receive');
 
             // Send notification to Web or Android device if message is from the partner
             if (payload && payload.eventType === 'INSERT' && payload.new) {
               const newRow = payload.new;
               const myUsername = loggedInUserId ? ID_TO_USERNAME[loggedInUserId] : '';
               if (newRow.sender && newRow.sender !== myUsername) {
-                const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
-                const partnerName = profiles[partnerId]?.name || 'My Love ♡';
-                let snippet = newRow.content;
-                if (newRow.type === 'video') snippet = '🎥 أرسل مقطع فيديو جديد';
-                else if (newRow.type === 'sticker' || newRow.type === 'image') snippet = '🖼️ أرسل صورة / ملصق حب جديد';
-                else if (newRow.type === 'voice') snippet = '🎤 أرسل رسالة صوتية جديدة';
+                if (!notifiedMsgIdsRef.current.has(newRow.id)) {
+                  notifiedMsgIdsRef.current.add(newRow.id);
+                  playSound('receive');
+                  const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
+                  const partnerName = profilesRef.current[partnerId]?.name || 'My Love ♡';
+                  let snippet = newRow.content;
+                  if (newRow.type === 'video') snippet = '🎥 أرسل مقطع فيديو جديد';
+                  else if (newRow.type === 'sticker' || newRow.type === 'image') snippet = '🖼️ أرسل صورة / ملصق حب جديد';
+                  else if (newRow.type === 'voice') snippet = '🎤 أرسل رسالة صوتية جديدة';
 
-                sendIncomingMessageNotification({
-                  id: newRow.id,
-                  title: `${partnerName} ♡`,
-                  body: snippet || 'رسالة حب جديدة ❤️',
-                  senderAvatar: profiles[partnerId]?.avatar
-                });
+                  sendIncomingMessageNotification({
+                    id: newRow.id,
+                    title: `${partnerName} ♡`,
+                    body: snippet || 'رسالة حب جديدة ❤️',
+                    senderAvatar: profilesRef.current[partnerId]?.avatar
+                  });
+                }
               }
             }
           }
@@ -931,7 +963,7 @@ export default function App() {
         supabase.removeChannel(channel);
       };
     }
-  }, [fetchSupabaseData, loggedInUserId, playSound, profiles]);
+  }, [fetchSupabaseData, loggedInUserId, playSound]);
 
   // Local BroadcastChannel fallback for cross-tab testing on same device
   useEffect(() => {
@@ -942,28 +974,14 @@ export default function App() {
       channel.onmessage = (event) => {
         const { type, payload } = event.data || {};
         if (type === 'SYNC_MESSAGES') {
-          setMessages((prev) => {
-            if (Array.isArray(payload) && payload.length > prev.length) {
-              const lastMsg = payload[payload.length - 1];
-              if (lastMsg && lastMsg.senderId !== loggedInUserId) {
-                const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
-                const partnerName = profiles[partnerId]?.name || 'My Love ♡';
-                let snippet = lastMsg.text;
-                if (lastMsg.type === 'video') snippet = '🎥 أرسل مقطع فيديو جديد';
-                else if (lastMsg.type === 'sticker') snippet = '🖼️ أرسل صورة / ملصق حب جديد';
-                else if (lastMsg.type === 'voice') snippet = '🎤 أرسل رسالة صوتية جديدة';
-
-                sendIncomingMessageNotification({
-                  id: lastMsg.id,
-                  title: `${partnerName} ♡`,
-                  body: snippet || 'رسالة حب جديدة ❤️',
-                  senderAvatar: profiles[partnerId]?.avatar
-                });
-              }
-            }
-            return payload;
-          });
-          playSound('receive');
+          if (Array.isArray(payload)) {
+            setMessages((prev) => {
+              const pendingUploads = prev.filter(
+                (m) => m.isUploading && !payload.some((dbMsg: any) => dbMsg.id === m.id)
+              );
+              return [...payload, ...pendingUploads];
+            });
+          }
         } else if (type === 'SYNC_WALLPAPER') {
           setChatBg(payload.chatBg);
           setCustomBgUrl(payload.customBgUrl);
@@ -1451,6 +1469,7 @@ export default function App() {
     const nextMessages = [...messages, newMsg];
     setMessages(nextMessages);
     broadcastUpdate('SYNC_MESSAGES', nextMessages);
+    isCurrentlyTypingRef.current = false;
     broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: false });
 
     const replyIdForDb =
@@ -1487,15 +1506,28 @@ export default function App() {
     }
   };
 
-  // Handle Input Typing Indicator
+  // Handle Input Typing Indicator (Throttled & Debounced)
   const handleInputChange = (val: string) => {
     setInputText(val);
     if (!loggedInUserId) return;
-    broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: val.length > 0 });
-    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = setTimeout(() => {
-      broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: false });
-    }, 2000);
+
+    if (val.length > 0) {
+      if (!isCurrentlyTypingRef.current) {
+        isCurrentlyTypingRef.current = true;
+        broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: true });
+      }
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = setTimeout(() => {
+        isCurrentlyTypingRef.current = false;
+        broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: false });
+      }, 2500);
+    } else {
+      if (isCurrentlyTypingRef.current) {
+        isCurrentlyTypingRef.current = false;
+        broadcastUpdate('PARTNER_TYPING', { userId: loggedInUserId, isTyping: false });
+      }
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    }
   };
 
   // Delete Message for Both

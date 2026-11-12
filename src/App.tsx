@@ -1,12 +1,20 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Heart, Send, Smile, Paperclip, Mic, Image as ImageIcon,
   Settings, Info, Trash2, Edit3, CornerUpLeft, MoreVertical,
   Phone, Video, Moon, Sun, X, Check, CheckCheck,
   Sparkles, PenTool, Plus, LogOut, ArrowLeft,
-  Lock, User, KeyRound, MessageCircle, Database, ShieldCheck, Play, Pause
+  Lock, User, KeyRound, MessageCircle, Database, ShieldCheck, Play, Pause,
+  Pin, PinOff, Star, Search, ChevronDown, ChevronUp, Copy, Film, Volume2,
+  Bell, BellRing
 } from 'lucide-react';
 import { getSupabaseClient, getSupabaseConfig, uploadMediaToStorage } from './lib/supabase';
+import {
+  initNotificationChannel,
+  requestNotificationPermission,
+  checkNotificationPermission,
+  sendIncomingMessageNotification
+} from './lib/notifications';
 
 // Private Pre-Configured Couple Accounts
 const COUPLE_ACCOUNTS: Record<string, any> = {
@@ -137,6 +145,119 @@ function dataURLtoBlob(dataurl: string): Blob | null {
   }
 }
 
+// WhatsApp-style Intelligent Date Grouping
+function getMessageDateGroup(timestamp?: number): string {
+  if (!timestamp) return 'اليوم';
+  const msgDate = new Date(timestamp);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const msgDay = new Date(msgDate.getFullYear(), msgDate.getMonth(), msgDate.getDate());
+  const diffDays = Math.round((today.getTime() - msgDay.getTime()) / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return 'اليوم';
+  if (diffDays === 1) return 'أمس';
+
+  return msgDate.toLocaleDateString('ar-EG', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: msgDate.getFullYear() !== now.getFullYear() ? 'numeric' : undefined
+  });
+}
+
+// Telegram & WhatsApp Rich Text Formatter with Telegram Spoilers & Search Highlight
+function FormattedMessageText({
+  text,
+  searchQuery
+}: {
+  text: string;
+  searchQuery?: string;
+}) {
+  const [revealedSpoilers, setRevealedSpoilers] = useState<Record<number, boolean>>({});
+
+  // Tokenize Telegram spoilers (||secret||), *bold*, _italic_, ~strike~
+  const parts = useMemo(() => {
+    return text.split(/(\|\|[\s\S]*?\|\||\*[^\s*][^*]*?[^\s*]\*|_[^\s_][^_]*?[^\s_]_|~[^\s~][^~]*?[^\s~]~)/g);
+  }, [text]);
+
+  const renderHighlighted = (content: string, keyPrefix: string | number) => {
+    if (!searchQuery || !searchQuery.trim()) return content;
+    const q = searchQuery.trim();
+    const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    const subParts = content.split(regex);
+
+    return subParts.map((sub, i) => {
+      if (sub.toLowerCase() === q.toLowerCase()) {
+        return (
+          <mark
+            key={`${keyPrefix}-${i}`}
+            className="bg-amber-300 dark:bg-amber-500 text-slate-900 font-bold px-0.5 rounded-xs"
+          >
+            {sub}
+          </mark>
+        );
+      }
+      return sub;
+    });
+  };
+
+  return (
+    <span className="text-sm leading-relaxed break-words whitespace-pre-wrap select-text">
+      {parts.map((part, idx) => {
+        if (!part) return null;
+
+        // Telegram Spoiler: ||spoiler||
+        if (part.startsWith('||') && part.endsWith('||') && part.length >= 4) {
+          const secret = part.slice(2, -2);
+          const isRevealed = revealedSpoilers[idx];
+          return (
+            <span
+              key={idx}
+              onClick={(e) => {
+                e.stopPropagation();
+                setRevealedSpoilers((prev) => ({ ...prev, [idx]: !prev[idx] }));
+              }}
+              className={isRevealed ? 'spoiler-revealed' : 'spoiler-hidden'}
+              title={isRevealed ? '' : 'انقر لكشف السر 🤫'}
+            >
+              {renderHighlighted(secret, `sp-${idx}`)}
+            </span>
+          );
+        }
+
+        // WhatsApp Bold: *bold*
+        if (part.startsWith('*') && part.endsWith('*') && part.length >= 2) {
+          return (
+            <strong key={idx} className="font-bold">
+              {renderHighlighted(part.slice(1, -1), `b-${idx}`)}
+            </strong>
+          );
+        }
+
+        // WhatsApp Italic: _italic_
+        if (part.startsWith('_') && part.endsWith('_') && part.length >= 2) {
+          return (
+            <em key={idx} className="italic">
+              {renderHighlighted(part.slice(1, -1), `i-${idx}`)}
+            </em>
+          );
+        }
+
+        // WhatsApp Strikethrough: ~strike~
+        if (part.startsWith('~') && part.endsWith('~') && part.length >= 2) {
+          return (
+            <del key={idx} className="line-through opacity-75">
+              {renderHighlighted(part.slice(1, -1), `s-${idx}`)}
+            </del>
+          );
+        }
+
+        return <React.Fragment key={idx}>{renderHighlighted(part, `txt-${idx}`)}</React.Fragment>;
+      })}
+    </span>
+  );
+}
+
 export default function App() {
   // 1. PERSISTENT SINGLE-ACCOUNT AUTHENTICATION STATE
   const [loggedInUserId, setLoggedInUserId] = useState<string | null>(() => {
@@ -211,9 +332,9 @@ export default function App() {
 
   // 7. COMPOSER & INTERACTIVE UI STATES
   const [inputText, setInputText] = useState('');
-  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [showMediaDrawer, setShowMediaDrawer] = useState(false);
+  const [mediaDrawerTab, setMediaDrawerTab] = useState<'emojis' | 'stickers'>('emojis');
   const [activeEmojiCat, setActiveEmojiCat] = useState('people');
-  const [showStickerPicker, setShowStickerPicker] = useState(false);
   const [showMoodDropdown, setShowMoodDropdown] = useState(false);
   const [replyingTo, setReplyingTo] = useState<any>(null);
   const [editingMessage, setEditingMessage] = useState<any>(null);
@@ -227,6 +348,43 @@ export default function App() {
     isVideo: boolean;
   } | null>(null);
   const [lightboxImageUrl, setLightboxImageUrl] = useState<string | null>(null);
+
+  // Swipe-to-reply touch gesture state
+  const [swipingId, setSwipingId] = useState<string | null>(null);
+  const [swipeOffset, setSwipeOffset] = useState<number>(0);
+  const touchStartPos = useRef<{ x: number; y: number } | null>(null);
+
+  const handleTouchStart = (e: React.TouchEvent, id: string) => {
+    touchStartPos.current = {
+      x: e.touches[0].clientX,
+      y: e.touches[0].clientY
+    };
+  };
+
+  const handleTouchMove = (e: React.TouchEvent, id: string) => {
+    if (!touchStartPos.current) return;
+    const deltaX = e.touches[0].clientX - touchStartPos.current.x;
+    const deltaY = e.touches[0].clientY - touchStartPos.current.y;
+    if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 8) {
+      const clamped = Math.sign(deltaX) * Math.min(Math.abs(deltaX), 75);
+      setSwipingId(id);
+      setSwipeOffset(clamped);
+    }
+  };
+
+  const handleTouchEnd = (msg: any) => {
+    if (swipingId === msg.id && Math.abs(swipeOffset) >= 40) {
+      setReplyingTo(msg);
+      try {
+        if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
+          navigator.vibrate(25);
+        }
+      } catch {}
+    }
+    setSwipingId(null);
+    setSwipeOffset(0);
+    touchStartPos.current = null;
+  };
 
   // Voice Note Recorder State
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
@@ -250,6 +408,244 @@ export default function App() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const supabaseChannelRef = useRef<any>(null);
   const typingTimeoutRef = useRef<any>(null);
+
+  // 8. TELEGRAM & WHATSAPP ADVANCED FEATURES STATE
+  // A. Pinned Messages (WhatsApp / Telegram style)
+  const [pinnedMsgId, setPinnedMsgId] = useState<string | null>(() => {
+    return localStorage.getItem('romantic_chat_pinned_id') || null;
+  });
+
+  // B. Starred Messages (WhatsApp / Telegram "Saved Memories")
+  const [starredMsgIds, setStarredMsgIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('romantic_chat_starred_ids');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [showStarredModal, setShowStarredModal] = useState(false);
+
+  // C. In-Chat Realtime Search
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [currentMatchIdx, setCurrentMatchIdx] = useState(0);
+
+  // D. Smart Scroll-To-Bottom with Unread Count Badge
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [newUnseenCount, setNewUnseenCount] = useState(0);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+
+  // E. Voice Message Player 2.0 (Speed 1x / 1.5x / 2x + Duration tracker)
+  const [voicePlaybackSpeed, setVoicePlaybackSpeed] = useState<number>(1);
+  const [audioProgress, setAudioProgress] = useState<Record<string, { current: number; total: number }>>({});
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  // F. Telegram Animated Reaction Burst (Hearts explosion)
+  const [floatingParticles, setFloatingParticles] = useState<Array<{
+    id: number;
+    x: number;
+    y: number;
+    tx: number;
+    rot: number;
+    char: string;
+  }>>([]);
+
+  // G. Highlighted Jumped-To Message
+  const [highlightedMsgId, setHighlightedMsgId] = useState<string | null>(null);
+
+  // H. Sweet Toast Notification
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastTimeoutRef = useRef<any>(null);
+
+  // I. Shared Media Gallery Modal
+  const [showSharedMediaModal, setShowSharedMediaModal] = useState(false);
+  const [sharedMediaTab, setSharedMediaTab] = useState<'media' | 'voice' | 'stickers'>('media');
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastMessage(null);
+    }, 2500);
+  }, []);
+
+  const jumpToMessage = useCallback((msgId: string) => {
+    const el = document.getElementById(`msg-${msgId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setHighlightedMsgId(msgId);
+      setTimeout(() => {
+        setHighlightedMsgId(null);
+      }, 2200);
+    }
+  }, []);
+
+  const triggerReactionBurst = useCallback((x: number, y: number, emoji = '❤️') => {
+    const chars = emoji === '❤️'
+      ? ['❤️', '💖', '💕', '✨', '🌹', '🥰', '💓']
+      : emoji === '🔥'
+      ? ['🔥', '✨', '⚡', '💥', '❤️']
+      : [emoji, '✨', '💫', '💖'];
+
+    const newParticles = Array.from({ length: 14 }).map((_, i) => ({
+      id: Date.now() + i + Math.random(),
+      x: x + (Math.random() - 0.5) * 40,
+      y: y + (Math.random() - 0.5) * 30,
+      tx: (Math.random() - 0.5) * 130,
+      rot: (Math.random() - 0.5) * 60,
+      char: chars[Math.floor(Math.random() * chars.length)]
+    }));
+
+    setFloatingParticles((prev) => [...prev, ...newParticles]);
+    setTimeout(() => {
+      setFloatingParticles((prev) => prev.filter((p) => !newParticles.some((np) => np.id === p.id)));
+    }, 1600);
+  }, []);
+
+  const handleTogglePinMessage = useCallback((msgId: string) => {
+    setPinnedMsgId((prev) => {
+      const next = prev === msgId ? null : msgId;
+      if (next) {
+        localStorage.setItem('romantic_chat_pinned_id', next);
+      } else {
+        localStorage.removeItem('romantic_chat_pinned_id');
+      }
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'SYNC_PINNED', payload: { pinnedId: next } });
+      }
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'SYNC_PINNED',
+          payload: { pinnedId: next }
+        });
+      }
+      showToast(next ? 'تم تثبيت الرسالة في أعلى المحادثة 📌' : 'تم إلغاء تثبيت الرسالة');
+      return next;
+    });
+    setActiveMessageActionId(null);
+  }, [showToast]);
+
+  const handleToggleStarMessage = useCallback((msgId: string) => {
+    setStarredMsgIds((prev) => {
+      const exists = prev.includes(msgId);
+      const next = exists ? prev.filter((id) => id !== msgId) : [...prev, msgId];
+      localStorage.setItem('romantic_chat_starred_ids', JSON.stringify(next));
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'SYNC_STARRED', payload: { starredIds: next } });
+      }
+      if (supabaseChannelRef.current) {
+        supabaseChannelRef.current.send({
+          type: 'broadcast',
+          event: 'SYNC_STARRED',
+          payload: { starredIds: next }
+        });
+      }
+      showToast(exists ? 'تمت إزالة النجمة ⭐' : 'تم حفظ الرسالة في ذكرياتكما المميزة ⭐');
+      return next;
+    });
+    setActiveMessageActionId(null);
+  }, [showToast]);
+
+  const handleCopyMessage = useCallback((text?: string) => {
+    if (!text) return;
+    try {
+      navigator.clipboard.writeText(text);
+      showToast('تم نسخ نص الرسالة إلى الحافظة 📋');
+    } catch {
+      showToast('تعذر النسخ تلقائياً');
+    }
+    setActiveMessageActionId(null);
+  }, [showToast]);
+
+  const cycleVoiceSpeed = useCallback(() => {
+    const speeds = [1, 1.5, 2];
+    setVoicePlaybackSpeed((prev) => {
+      const next = speeds[(speeds.indexOf(prev) + 1) % speeds.length];
+      if (activeAudioRef.current) {
+        activeAudioRef.current.playbackRate = next;
+      }
+      showToast(`تم ضبط سرعة الصوت على ${next}x ⚡`);
+      return next;
+    });
+  }, [showToast]);
+
+  // Search matches memo
+  const searchMatches = useMemo(() => {
+    if (!searchQuery.trim()) return [];
+    const q = searchQuery.trim().toLowerCase();
+    return messages
+      .filter((m) => m.type === 'text' && m.text && m.text.toLowerCase().includes(q))
+      .map((m) => m.id);
+  }, [messages, searchQuery]);
+
+  // Auto-jump to current search match
+  useEffect(() => {
+    if (searchMatches.length > 0) {
+      const targetId = searchMatches[currentMatchIdx] || searchMatches[0];
+      if (targetId) jumpToMessage(targetId);
+    }
+  }, [searchMatches, currentMatchIdx, jumpToMessage]);
+
+  const handleNextSearchMatch = () => {
+    if (searchMatches.length === 0) return;
+    const nextIdx = (currentMatchIdx + 1) % searchMatches.length;
+    setCurrentMatchIdx(nextIdx);
+  };
+
+  const handlePrevSearchMatch = () => {
+    if (searchMatches.length === 0) return;
+    const prevIdx = (currentMatchIdx - 1 + searchMatches.length) % searchMatches.length;
+    setCurrentMatchIdx(prevIdx);
+  };
+
+  const handleMessagesScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const target = e.currentTarget;
+    const distanceToBottom = target.scrollHeight - target.scrollTop - target.clientHeight;
+    const isScrolledUp = distanceToBottom > 160;
+    setShowScrollBottom(isScrolledUp);
+    if (!isScrolledUp) {
+      setNewUnseenCount(0);
+    }
+  };
+
+  // 9. WEB & MOBILE NOTIFICATIONS STATE & HANDLERS
+  const [notificationsGranted, setNotificationsGranted] = useState(false);
+
+  useEffect(() => {
+    initNotificationChannel();
+    checkNotificationPermission().then(setNotificationsGranted);
+  }, []);
+
+  const handleEnableNotifications = async () => {
+    const granted = await requestNotificationPermission();
+    setNotificationsGranted(granted);
+    if (granted) {
+      showToast('تم تفعيل الإشعارات بنجاح 🔔❤️');
+      sendIncomingMessageNotification({
+        title: 'ChatApp ♡',
+        body: 'تم تفعيل الإشعارات بنجاح! ستصلك رسائل حبيبك فوراً ❤️'
+      });
+    } else {
+      showToast('لم يتم منح إذن الإشعارات، يمكنك تفعيلها من إعدادات المتصفح أو الهاتف');
+    }
+  };
+
+  const handleTestNotification = async () => {
+    const granted = await checkNotificationPermission();
+    if (!granted) {
+      await handleEnableNotifications();
+    } else {
+      const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
+      const partnerName = profiles[partnerId]?.name || 'My Love ♡';
+      sendIncomingMessageNotification({
+        title: `${partnerName} ♡`,
+        body: 'إشعار تجريبي: بحبك ومستني رسالتك دلوقتي ❤️'
+      });
+      showToast('تم إرسال إشعار تجريبي لجهازك الآن 🔔✨');
+    }
+  };
 
   // Sound Synthesizer
   const playSound = useCallback((type = 'send') => {
@@ -459,9 +855,30 @@ export default function App() {
         .on(
           'postgres_changes',
           { event: '*', schema: 'public', table: 'messages' },
-          () => {
+          (payload: any) => {
             fetchSupabaseData();
             playSound('receive');
+
+            // Send notification to Web or Android device if message is from the partner
+            if (payload && payload.eventType === 'INSERT' && payload.new) {
+              const newRow = payload.new;
+              const myUsername = loggedInUserId ? ID_TO_USERNAME[loggedInUserId] : '';
+              if (newRow.sender && newRow.sender !== myUsername) {
+                const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
+                const partnerName = profiles[partnerId]?.name || 'My Love ♡';
+                let snippet = newRow.content;
+                if (newRow.type === 'video') snippet = '🎥 أرسل مقطع فيديو جديد';
+                else if (newRow.type === 'sticker' || newRow.type === 'image') snippet = '🖼️ أرسل صورة / ملصق حب جديد';
+                else if (newRow.type === 'voice') snippet = '🎤 أرسل رسالة صوتية جديدة';
+
+                sendIncomingMessageNotification({
+                  id: newRow.id,
+                  title: `${partnerName} ♡`,
+                  body: snippet || 'رسالة حب جديدة ❤️',
+                  senderAvatar: profiles[partnerId]?.avatar
+                });
+              }
+            }
           }
         )
         .on(
@@ -490,6 +907,22 @@ export default function App() {
             setIsPartnerTyping(Boolean(payload.isTyping));
           }
         })
+        .on('broadcast', { event: 'SYNC_PINNED' }, ({ payload }) => {
+          if (payload) {
+            setPinnedMsgId(payload.pinnedId || null);
+            if (payload.pinnedId) {
+              localStorage.setItem('romantic_chat_pinned_id', payload.pinnedId);
+            } else {
+              localStorage.removeItem('romantic_chat_pinned_id');
+            }
+          }
+        })
+        .on('broadcast', { event: 'SYNC_STARRED' }, ({ payload }) => {
+          if (payload && Array.isArray(payload.starredIds)) {
+            setStarredMsgIds(payload.starredIds);
+            localStorage.setItem('romantic_chat_starred_ids', JSON.stringify(payload.starredIds));
+          }
+        })
         .subscribe();
 
       supabaseChannelRef.current = channel;
@@ -498,7 +931,7 @@ export default function App() {
         supabase.removeChannel(channel);
       };
     }
-  }, [fetchSupabaseData, loggedInUserId, playSound]);
+  }, [fetchSupabaseData, loggedInUserId, playSound, profiles]);
 
   // Local BroadcastChannel fallback for cross-tab testing on same device
   useEffect(() => {
@@ -509,7 +942,27 @@ export default function App() {
       channel.onmessage = (event) => {
         const { type, payload } = event.data || {};
         if (type === 'SYNC_MESSAGES') {
-          setMessages(payload);
+          setMessages((prev) => {
+            if (Array.isArray(payload) && payload.length > prev.length) {
+              const lastMsg = payload[payload.length - 1];
+              if (lastMsg && lastMsg.senderId !== loggedInUserId) {
+                const partnerId = loggedInUserId === 'user1' ? 'user2' : 'user1';
+                const partnerName = profiles[partnerId]?.name || 'My Love ♡';
+                let snippet = lastMsg.text;
+                if (lastMsg.type === 'video') snippet = '🎥 أرسل مقطع فيديو جديد';
+                else if (lastMsg.type === 'sticker') snippet = '🖼️ أرسل صورة / ملصق حب جديد';
+                else if (lastMsg.type === 'voice') snippet = '🎤 أرسل رسالة صوتية جديدة';
+
+                sendIncomingMessageNotification({
+                  id: lastMsg.id,
+                  title: `${partnerName} ♡`,
+                  body: snippet || 'رسالة حب جديدة ❤️',
+                  senderAvatar: profiles[partnerId]?.avatar
+                });
+              }
+            }
+            return payload;
+          });
           playSound('receive');
         } else if (type === 'SYNC_WALLPAPER') {
           setChatBg(payload.chatBg);
@@ -523,6 +976,10 @@ export default function App() {
           setPartnerMoods(payload);
         } else if (type === 'SYNC_PROFILES') {
           setProfiles(payload);
+        } else if (type === 'SYNC_PINNED') {
+          setPinnedMsgId(payload?.pinnedId || null);
+        } else if (type === 'SYNC_STARRED') {
+          if (Array.isArray(payload?.starredIds)) setStarredMsgIds(payload.starredIds);
         } else if (type === 'PARTNER_TYPING') {
           if (payload.userId !== loggedInUserId) {
             setIsPartnerTyping(payload.isTyping);
@@ -538,10 +995,10 @@ export default function App() {
     if (broadcastChannelRef.current) {
       broadcastChannelRef.current.postMessage({ type, payload });
     }
-    if (type === 'PARTNER_TYPING' && supabaseChannelRef.current) {
+    if (['PARTNER_TYPING', 'SYNC_PINNED', 'SYNC_STARRED'].includes(type) && supabaseChannelRef.current) {
       supabaseChannelRef.current.send({
         type: 'broadcast',
-        event: 'PARTNER_TYPING',
+        event: type,
         payload
       });
     }
@@ -583,10 +1040,12 @@ export default function App() {
     localStorage.setItem('romantic_chat_anniversary', anniversaryDate);
   }, [anniversaryDate]);
 
-  // Auto-scroll to bottom on new message
+  // Auto-scroll to bottom on new message (unless user has scrolled up to read older messages)
   useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isPartnerTyping, loggedInUserId]);
+    if (!showScrollBottom) {
+      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, isPartnerTyping, loggedInUserId, showScrollBottom]);
 
   // Mark partner messages as read when logged in user views chat
   useEffect(() => {
@@ -798,8 +1257,7 @@ export default function App() {
       });
       setReplyingTo(null);
       setPastedMedia(null);
-      setShowEmojiPicker(false);
-      setShowStickerPicker(false);
+      setShowMediaDrawer(false);
       playSound('send');
 
       if (isVideo) {
@@ -1000,8 +1458,7 @@ export default function App() {
 
     setInputText('');
     setReplyingTo(null);
-    setShowEmojiPicker(false);
-    setShowStickerPicker(false);
+    setShowMediaDrawer(false);
     playSound('send');
 
     if (supabase && dbConnected) {
@@ -1054,8 +1511,8 @@ export default function App() {
     }
   };
 
-  // Toggle Emoji Reaction
-  const handleToggleReaction = async (msgId: string, emoji: string) => {
+  // Toggle Emoji Reaction with Telegram-style Burst Effect
+  const handleToggleReaction = async (msgId: string, emoji: string, clientX?: number, clientY?: number) => {
     let updatedReactions: string[] = [];
     const nextMessages = messages.map((msg) => {
       if (msg.id !== msgId) return msg;
@@ -1069,6 +1526,11 @@ export default function App() {
     broadcastUpdate('SYNC_MESSAGES', nextMessages);
     setActiveMessageActionId(null);
     playSound('receive');
+
+    // Trigger Telegram Floating Reaction Particles
+    const posX = clientX ?? (typeof window !== 'undefined' ? window.innerWidth / 2 : 200);
+    const posY = clientY ?? (typeof window !== 'undefined' ? window.innerHeight / 2 : 300);
+    triggerReactionBurst(posX, posY, emoji);
 
     const supabase = getSupabaseClient();
     if (supabase && dbConnected && !String(msgId).startsWith('msg-')) {
@@ -1534,8 +1996,29 @@ export default function App() {
           </span>
         </div>
 
-        {/* Right Status Pill & Theme Toggle */}
-        <div className="flex items-center gap-2.5">
+        {/* Right Status Pill, Notification Action & Theme Toggle */}
+        <div className="flex items-center gap-2">
+          {!notificationsGranted ? (
+            <button
+              type="button"
+              onClick={handleEnableNotifications}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 dark:bg-amber-950/60 border border-amber-300 dark:border-amber-700/70 text-amber-700 dark:text-amber-300 text-xs font-semibold hover:bg-amber-100 dark:hover:bg-amber-900/50 transition cursor-pointer animate-pulse"
+              title="تفعيل الإشعارات ليصلك تنبيه فوري بالرسائل الجديدة"
+            >
+              <Bell className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">تفعيل الإشعارات</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleTestNotification}
+              className="p-1.5 rounded-xl text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-slate-800 transition cursor-pointer"
+              title="الإشعارات مفعلة ✓ (انقر لتجربة إشعار)"
+            >
+              <BellRing className="w-4 h-4" />
+            </button>
+          )}
+
           <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-50/80 dark:bg-[#131B2E] border border-rose-200/60 dark:border-slate-800 text-xs font-semibold text-[#C8102E] dark:text-rose-400">
             <Heart className="w-3.5 h-3.5 fill-current" />
             <span>{getDaysTogether()} Days Together</span>
@@ -1781,12 +2264,62 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 4. Web & Mobile Notifications Management Card */}
+                <div className="p-5 rounded-2xl bg-white dark:bg-[#131B2E] border border-rose-100 dark:border-slate-800 shadow-xs space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-bold text-sm text-[#C8102E] dark:text-rose-400 flex items-center gap-2">
+                      <Bell className="w-4 h-4" />
+                      <span>4. إشعارات الويب وتطبيق الموبايل (Push & Local Notifications)</span>
+                    </h3>
+                    <span
+                      className={`text-[11px] px-2.5 py-0.5 rounded-full font-semibold ${
+                        notificationsGranted
+                          ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400'
+                          : 'bg-amber-50 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400'
+                      }`}
+                    >
+                      {notificationsGranted ? 'الإشعارات مفعلة ✓' : 'بانتظار تفعيل الإذن'}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+                    يصلك إشعار فوري عند استلام أي رسالة جديدة من الطرف الآخر، سواء كنت تستخدم الموقع عبر اللابتوب/المتصفح أو تستخدم تطبيق الأندرويد المثبت على هاتفك.
+                  </p>
+
+                  <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                    {!notificationsGranted ? (
+                      <button
+                        type="button"
+                        onClick={handleEnableNotifications}
+                        className="px-4 py-2 rounded-xl bg-[#C8102E] hover:bg-[#a80d26] text-white text-xs font-bold flex items-center gap-1.5 shadow-sm transition cursor-pointer"
+                      >
+                        <Bell className="w-4 h-4" />
+                        <span>تفعيل الإشعارات الآن</span>
+                      </button>
+                    ) : (
+                      <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400 font-semibold py-1">
+                        <Check className="w-4 h-4" />
+                        <span>جهازك جاهز لاستقبال الإشعارات</span>
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={handleTestNotification}
+                      className="px-4 py-2 rounded-xl border border-rose-200 dark:border-slate-700 bg-rose-50/50 dark:bg-[#1E2738] hover:bg-rose-100 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <BellRing className="w-4 h-4 text-[#C8102E]" />
+                      <span>تجربة إرسال إشعار فوري للتحقق 🔔</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Supabase Database Connection Settings */}
                 <div className="p-5 rounded-2xl bg-white dark:bg-[#131B2E] border border-rose-100 dark:border-slate-800 shadow-xs space-y-3">
                   <div className="flex items-center justify-between">
                     <h3 className="font-bold text-sm text-[#C8102E] dark:text-rose-400 flex items-center gap-1.5">
                       <Database className="w-4 h-4" />
-                      <span>4. إعدادات الربط السحابي (Supabase Realtime)</span>
+                      <span>5. إعدادات الربط السحابي (Supabase Realtime)</span>
                     </h3>
                     <span
                       className={`text-[11px] px-2.5 py-0.5 rounded-full font-semibold ${
@@ -1890,6 +2423,50 @@ export default function App() {
 
                 {/* Conversation Action Icons */}
                 <div className="flex items-center gap-1 sm:gap-1.5">
+                  {/* WhatsApp / Telegram Search Button */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsSearchOpen(!isSearchOpen);
+                      if (isSearchOpen) setSearchQuery('');
+                    }}
+                    className={`p-2 rounded-xl transition cursor-pointer ${
+                      isSearchOpen
+                        ? 'bg-[#C8102E] text-white shadow-xs'
+                        : 'text-slate-700 dark:text-slate-200 hover:bg-rose-50 dark:hover:bg-slate-800'
+                    }`}
+                    title="بحث في الرسائل (Ctrl+F)"
+                  >
+                    <Search className="w-4 h-4" />
+                  </button>
+
+                  {/* Starred Messages Button */}
+                  <button
+                    type="button"
+                    onClick={() => setShowStarredModal(true)}
+                    className="relative p-2 rounded-xl text-slate-700 dark:text-slate-200 hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+                    title="الرسائل والذكريات المميزة بنجمة"
+                  >
+                    <Star
+                      className={`w-4 h-4 ${
+                        starredMsgIds.length > 0 ? 'fill-amber-400 text-amber-400' : ''
+                      }`}
+                    />
+                    {starredMsgIds.length > 0 && (
+                      <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-amber-400"></span>
+                    )}
+                  </button>
+
+                  {/* Shared Media Gallery Button */}
+                  <button
+                    type="button"
+                    onClick={() => setShowSharedMediaModal(true)}
+                    className="p-2 rounded-xl text-slate-700 dark:text-slate-200 hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+                    title="معرض الوسائط والملفات المشتركة"
+                  >
+                    <Film className="w-4 h-4" />
+                  </button>
+
                   <div className="relative">
                     <button
                       onClick={() => setShowMoodDropdown(!showMoodDropdown)}
@@ -1955,13 +2532,135 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Messages Canvas with Shared Wallpaper */}
+              {/* WHATSAPP / TELEGRAM IN-CHAT SEARCH BAR */}
+              {isSearchOpen && (
+                <div className="px-4 py-2 bg-white/95 dark:bg-[#1E2738]/95 border-b border-rose-200/80 dark:border-slate-700 flex items-center justify-between gap-3 shadow-xs z-20 animate-in fade-in duration-150">
+                  <div className="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-rose-50/70 dark:bg-[#161F33] border border-rose-200/60 dark:border-slate-700">
+                    <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                    <input
+                      type="text"
+                      autoFocus
+                      value={searchQuery}
+                      onChange={(e) => {
+                        setSearchQuery(e.target.value);
+                        setCurrentMatchIdx(0);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleNextSearchMatch();
+                        if (e.key === 'Escape') {
+                          setIsSearchOpen(false);
+                          setSearchQuery('');
+                        }
+                      }}
+                      placeholder="ابحث عن أي كلمة أو ذكرى في الرسائل..."
+                      className="w-full bg-transparent text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
+                    />
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setSearchQuery('')}
+                        className="p-0.5 rounded-full text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 px-1">
+                      {searchMatches.length > 0
+                        ? `${currentMatchIdx + 1} من ${searchMatches.length}`
+                        : searchQuery
+                        ? 'لا نتائج'
+                        : ''}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handlePrevSearchMatch}
+                      disabled={searchMatches.length === 0}
+                      className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-rose-50 dark:hover:bg-slate-800 disabled:opacity-30 cursor-pointer"
+                      title="النتيجة السابقة"
+                    >
+                      <ChevronUp className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleNextSearchMatch}
+                      disabled={searchMatches.length === 0}
+                      className="p-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-rose-50 dark:hover:bg-slate-800 disabled:opacity-30 cursor-pointer"
+                      title="النتيجة التالية"
+                    >
+                      <ChevronDown className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSearchOpen(false);
+                        setSearchQuery('');
+                      }}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-[#C8102E] hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+                      title="إغلاق البحث"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* TELEGRAM & WHATSAPP PINNED MESSAGE BAR */}
+              {(() => {
+                const pinnedMsg = messages.find((m) => m.id === pinnedMsgId);
+                if (!pinnedMsg) return null;
+                const senderName = profiles[pinnedMsg.senderId]?.name || 'رسالة مثبتة';
+                const snippet = pinnedMsg.text
+                  ? pinnedMsg.text
+                  : pinnedMsg.type === 'video'
+                  ? '🎥 مقطع فيديو'
+                  : pinnedMsg.type === 'sticker'
+                  ? '🖼️ صورة / ملصق'
+                  : '🎤 رسالة صوتية';
+
+                return (
+                  <div className="px-4 py-2 bg-white/95 dark:bg-[#161F33]/95 border-b border-rose-200/70 dark:border-slate-800 backdrop-blur-md flex items-center justify-between gap-3 shadow-2xs z-10 animate-in fade-in slide-in-from-top-1 duration-150">
+                    <div
+                      onClick={() => jumpToMessage(pinnedMsg.id)}
+                      className="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer group"
+                    >
+                      <div className="w-7 h-7 rounded-lg bg-rose-100 dark:bg-rose-950/60 text-[#C8102E] flex items-center justify-center shrink-0 group-hover:scale-110 transition shadow-2xs">
+                        <Pin className="w-3.5 h-3.5 fill-[#C8102E]" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-bold text-[#C8102E] dark:text-rose-400">
+                            رسالة مثبتة • {senderName}
+                          </span>
+                          <span className="text-[10px] text-slate-400">{pinnedMsg.time}</span>
+                        </div>
+                        <p className="text-xs text-slate-700 dark:text-slate-300 truncate font-medium group-hover:text-[#C8102E] dark:group-hover:text-rose-300 transition">
+                          {snippet}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleTogglePinMessage(pinnedMsg.id)}
+                      className="p-1.5 rounded-full text-slate-400 hover:text-[#C8102E] hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+                      title="إلغاء التثبيت"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              })()}
+
+              {/* Messages Canvas with Shared Wallpaper & Scroll tracking */}
               <div
+                ref={messagesContainerRef}
+                onScroll={handleMessagesScroll}
                 style={getBackgroundStyles()}
                 onClick={() => {
                   setActiveMessageActionId(null);
-                  setShowEmojiPicker(false);
-                  setShowStickerPicker(false);
+                  setShowMediaDrawer(false);
                   setShowMoodDropdown(false);
                 }}
                 onDragOver={(e) => {
@@ -1990,159 +2689,227 @@ export default function App() {
                   </div>
                 )}
 
-                {messages.map((msg) => {
+                {messages.map((msg, index) => {
                   const isMe = msg.senderId === loggedInUserId;
                   const isSelected = activeMessageActionId === msg.id;
+                  const isSwiping = swipingId === msg.id;
+                  const currentOffset = isSwiping ? swipeOffset : 0;
+                  const isHighlighted = highlightedMsgId === msg.id;
+                  const isStarred = starredMsgIds.includes(msg.id);
+                  const isPinned = pinnedMsgId === msg.id;
+                  const isNewDay =
+                    index === 0 ||
+                    getMessageDateGroup(msg.timestamp) !==
+                      getMessageDateGroup(messages[index - 1]?.timestamp);
 
                   return (
-                    <div
-                      key={msg.id}
-                      className={`flex flex-col relative ${
-                        isMe ? 'items-end' : 'items-start'
-                      }`}
-                    >
-                      {/* Quoted Reply Box */}
-                      {msg.replyTo && (
-                        <div
-                          className={`text-[11px] mb-1 px-3 py-1 rounded-xl border-l-3 max-w-xs sm:max-w-md ${
-                            isMe
-                              ? 'bg-red-900/15 dark:bg-rose-950/50 text-slate-700 dark:text-slate-200 border-[#C8102E]'
-                              : 'bg-white/90 dark:bg-[#1E2738] text-slate-600 dark:text-slate-300 border-rose-400 shadow-2xs'
-                          }`}
-                        >
-                          <span className="font-bold text-[#C8102E] dark:text-rose-400 block">
-                            {msg.replyTo.senderName}
-                          </span>
-                          <span className="truncate block opacity-85">{msg.replyTo.snippet}</span>
+                    <React.Fragment key={msg.id}>
+                      {/* WhatsApp Intelligent Date Chip Separator */}
+                      {isNewDay && (
+                        <div className="flex justify-center my-3 select-none">
+                          <div className="px-3.5 py-1 rounded-full text-[11px] font-semibold bg-white/85 dark:bg-[#1E2738]/90 text-slate-600 dark:text-slate-300 shadow-2xs border border-rose-200/50 dark:border-slate-700/60 backdrop-blur-md">
+                            {getMessageDateGroup(msg.timestamp)}
+                          </div>
                         </div>
                       )}
 
-                      {/* Message Bubble */}
-                      <div className="relative max-w-[82%] sm:max-w-md">
-                        {msg.type === 'sticker' ? (
+                      <div
+                        id={`msg-${msg.id}`}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setActiveMessageActionId(isSelected ? null : msg.id);
+                        }}
+                        onDoubleClick={() => {
+                          // Double click on empty space of message row triggers Reply
+                          setReplyingTo(msg);
+                        }}
+                        className={`group flex flex-col relative w-full py-1 cursor-default select-none transition-all rounded-2xl ${
+                          isHighlighted ? 'highlight-jump bg-[#C8102E]/10 ring-2 ring-[#C8102E]/50 p-1' : ''
+                        } ${isMe ? 'items-end' : 'items-start'}`}
+                      >
+                        {/* Quoted Reply Box */}
+                        {msg.replyTo && (
                           <div
                             onClick={(e) => {
                               e.stopPropagation();
-                              setActiveMessageActionId(isSelected ? null : msg.id);
+                              if (msg.replyTo.id) jumpToMessage(msg.replyTo.id);
                             }}
-                            onDoubleClick={(e) => {
-                              e.stopPropagation();
-                              handleToggleReaction(msg.id, '❤️');
-                            }}
-                            className="relative inline-block cursor-pointer group"
+                            className={`text-[11px] mb-1 px-3 py-1.5 rounded-xl border-l-4 max-w-xs sm:max-w-md shadow-2xs backdrop-blur-xs transition cursor-pointer hover:opacity-90 ${
+                              isMe
+                                ? 'bg-rose-900/15 dark:bg-rose-950/60 text-slate-700 dark:text-slate-200 border-[#C8102E]'
+                                : 'bg-white/95 dark:bg-[#1E2738]/95 text-slate-700 dark:text-slate-300 border-rose-400'
+                            }`}
                           >
-                            <img
-                              src={msg.stickerUrl}
-                              alt="Sent media"
-                              onClick={(e) => {
-                                if (e.detail === 1 && !isSelected) {
-                                  // Single click selects action menu; button in corner opens full view
-                                }
-                              }}
-                              className="max-w-[230px] sm:max-w-[280px] max-h-72 w-auto h-auto object-cover rounded-2xl drop-shadow-md border border-rose-200/50 dark:border-slate-700/60 transition-transform group-hover:scale-[1.01]"
-                            />
-                            {msg.isUploading && (
-                              <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
-                                جاري الرفع... ⚡
-                              </span>
-                            )}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setLightboxImageUrl(msg.stickerUrl);
-                              }}
-                              className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-slate-900/65 text-white text-[10px] opacity-0 group-hover:opacity-100 transition cursor-pointer"
-                              title="تكبير الصورة"
-                            >
-                              تكبير 🔍
-                            </button>
-                            <span className="absolute bottom-1.5 right-1.5 px-2.5 py-0.5 rounded-full bg-slate-900/75 text-white text-[10px] font-medium backdrop-blur-xs flex items-center gap-1">
-                              <span>{msg.time}</span>
-                              {isMe && (
-                                msg.status === 'read' ? (
-                                  <CheckCheck className="w-3 h-3 text-white stroke-[2.2]" />
-                                ) : (
-                                  <Check className="w-3 h-3 text-white/80 stroke-[2]" />
-                                )
-                              )}
+                            <span className="font-bold text-[#C8102E] dark:text-rose-400 block text-[10px]">
+                              {msg.replyTo.senderName}
+                            </span>
+                            <span className="truncate block opacity-90 text-[11px]">
+                              {msg.replyTo.snippet}
                             </span>
                           </div>
-                        ) : msg.type === 'video' ? (
-                          <div
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setActiveMessageActionId(isSelected ? null : msg.id);
-                            }}
-                            onDoubleClick={(e) => {
-                              e.stopPropagation();
-                              handleToggleReaction(msg.id, '❤️');
-                            }}
-                            className={`relative p-1.5 rounded-2xl shadow-md cursor-pointer ${
-                              isMe
-                                ? 'bg-[#C8102E] text-white rounded-br-xs'
-                                : 'bg-white dark:bg-[#1E2738] text-slate-900 dark:text-slate-100 rounded-bl-xs border border-rose-100/70 dark:border-slate-700/60'
-                            }`}
-                          >
-                            <div className="relative rounded-xl overflow-hidden bg-black">
-                              <video
-                                src={msg.videoUrl}
-                                controls
-                                playsInline
-                                preload="metadata"
-                                onClick={(e) => e.stopPropagation()}
-                                className="w-64 sm:w-80 max-h-80 object-contain rounded-xl bg-black"
-                              />
-                              {msg.isUploading && (
-                                <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
-                                  جاري رفع الفيديو... ⚡
-                                </span>
-                              )}
-                            </div>
+                        )}
+
+                        {/* Row Content with Touch Swipe & Desktop Hover Actions */}
+                        <div className="relative max-w-[85%] sm:max-w-md flex items-center gap-1.5">
+                          {/* Swipe-to-Reply Visual Indicator */}
+                          {isSwiping && Math.abs(currentOffset) > 12 && (
                             <div
-                              className={`flex items-center justify-end gap-1 px-2 pt-1 text-[10px] ${
-                                isMe ? 'text-rose-100' : 'text-slate-400'
-                              }`}
+                              className={`absolute top-1/2 -translate-y-1/2 flex items-center justify-center w-8 h-8 rounded-full pointer-events-none transition-all z-20 ${
+                                Math.abs(currentOffset) >= 40
+                                  ? 'bg-[#C8102E] text-white scale-110 shadow-md ring-2 ring-white/70 dark:ring-slate-900/70'
+                                  : 'bg-rose-100 dark:bg-slate-800 text-[#C8102E] scale-90'
+                              } ${currentOffset > 0 ? '-left-11' : '-right-11'}`}
                             >
-                              <span>🎥 فيديو</span>
-                              <span>•</span>
-                              <span>{msg.time}</span>
-                              {isMe && (
-                                msg.status === 'read' ? (
-                                  <CheckCheck className="w-3.5 h-3.5 text-white stroke-[2.2]" />
-                                ) : (
-                                  <Check className="w-3.5 h-3.5 text-white/80 stroke-[2]" />
-                                )
-                              )}
+                              <CornerUpLeft
+                                className={`w-4 h-4 ${currentOffset < 0 ? 'scale-x-[-1]' : ''}`}
+                              />
                             </div>
-                          </div>
-                        ) : (
+                          )}
+
+                          {/* Desktop Quick Actions on Hover (for My Messages: left side) */}
+                          {isMe && (
+                            <div className="hidden sm:flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setReplyingTo(msg);
+                                }}
+                                className="p-1.5 rounded-full hover:bg-rose-100/70 dark:hover:bg-slate-800 text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
+                                title="رد على الرسالة (Double click)"
+                              >
+                                <CornerUpLeft className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                className="p-1.5 rounded-full hover:bg-rose-100/70 dark:hover:bg-slate-800 text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
+                                title="تفاعل أو خيارات (Right click)"
+                              >
+                                <Smile className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          )}
+
+                          {/* Message Bubble Container with Spring Transform */}
                           <div
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setActiveMessageActionId(isSelected ? null : msg.id);
+                            style={{
+                              transform: currentOffset ? `translateX(${currentOffset}px)` : undefined,
+                              transition: isSwiping ? 'none' : 'transform 0.22s cubic-bezier(0.2, 0, 0, 1)'
                             }}
-                            onDoubleClick={(e) => {
-                              e.stopPropagation();
-                              handleToggleReaction(msg.id, '❤️');
-                            }}
-                            className={`relative px-4 py-2.5 cursor-pointer shadow-xs transition ${
-                              isMe
-                                ? 'bg-[#C8102E] text-white rounded-2xl rounded-br-xs'
-                                : 'bg-white dark:bg-[#1E2738] text-slate-900 dark:text-slate-100 rounded-2xl rounded-bl-xs border border-rose-100/70 dark:border-slate-700/60'
-                            }`}
+                            onTouchStart={(e) => handleTouchStart(e, msg.id)}
+                            onTouchMove={(e) => handleTouchMove(e, msg.id)}
+                            onTouchEnd={() => handleTouchEnd(msg)}
+                            className="relative max-w-full"
                           >
-                            {msg.type === 'text' && (
-                              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                                <span className="text-sm leading-relaxed break-words">
-                                  {msg.text}
+                            {msg.type === 'sticker' ? (
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleReaction(msg.id, '❤️', e.clientX, e.clientY);
+                                }}
+                                className="relative inline-block cursor-pointer group"
+                              >
+                                <img
+                                  src={msg.stickerUrl}
+                                  alt="Sent media"
+                                  className="max-w-[230px] sm:max-w-[280px] max-h-72 w-auto h-auto object-cover rounded-2xl drop-shadow-md border border-rose-200/50 dark:border-slate-700/60 transition-transform group-hover:scale-[1.01]"
+                                />
+                                {msg.isUploading && (
+                                  <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
+                                    جاري الرفع... ⚡
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setLightboxImageUrl(msg.stickerUrl);
+                                  }}
+                                  className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-slate-900/65 text-white text-[10px] opacity-0 group-hover:opacity-100 transition cursor-pointer"
+                                  title="تكبير الصورة"
+                                >
+                                  تكبير 🔍
+                                </button>
+                                <span className="absolute bottom-1.5 right-1.5 px-2.5 py-0.5 rounded-full bg-slate-900/75 text-white text-[10px] font-medium backdrop-blur-xs flex items-center gap-1">
+                                  {isStarred && (
+                                    <Star className="w-3 h-3 fill-amber-400 text-amber-400 shrink-0" />
+                                  )}
+                                  {isPinned && (
+                                    <Pin className="w-3 h-3 fill-[#C8102E] text-[#C8102E] shrink-0" />
+                                  )}
+                                  <span>{msg.time}</span>
+                                  {isMe && (
+                                    msg.status === 'read' ? (
+                                      <CheckCheck className="w-3 h-3 text-white stroke-[2.2]" />
+                                    ) : (
+                                      <Check className="w-3 h-3 text-white/80 stroke-[2]" />
+                                    )
+                                  )}
                                 </span>
-                                <span
-                                  className={`ml-auto flex items-center gap-1 text-[10px] shrink-0 select-none ${
-                                    isMe ? 'text-rose-100/90' : 'text-slate-400'
+                              </div>
+                            ) : msg.type === 'video' ? (
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleReaction(msg.id, '❤️', e.clientX, e.clientY);
+                                }}
+                                className={`relative p-1.5 rounded-2xl shadow-md cursor-pointer ${
+                                  isMe
+                                    ? 'bg-[#C8102E] text-white rounded-br-xs'
+                                    : 'bg-white dark:bg-[#1E2738] text-slate-900 dark:text-slate-100 rounded-bl-xs border border-rose-100/70 dark:border-slate-700/60'
+                                }`}
+                              >
+                                <div className="relative rounded-xl overflow-hidden bg-black">
+                                  <video
+                                    src={msg.videoUrl}
+                                    controls
+                                    playsInline
+                                    preload="metadata"
+                                    onClick={(e) => e.stopPropagation()}
+                                    className="w-64 sm:w-80 max-h-80 object-contain rounded-xl bg-black"
+                                  />
+                                  {msg.isUploading && (
+                                    <span className="absolute top-2 left-2 px-2.5 py-0.5 rounded-full bg-[#C8102E]/90 text-white text-[10px] font-semibold animate-pulse shadow-xs">
+                                      جاري رفع الفيديو... ⚡
+                                    </span>
+                                  )}
+                                </div>
+                                <div
+                                  className={`flex items-center justify-end gap-1 px-2 pt-1 text-[10px] ${
+                                    isMe ? 'text-rose-100' : 'text-slate-400'
                                   }`}
                                 >
-                                  {msg.edited && <span className="italic">معدلة</span>}
+                                  {isStarred && (
+                                    <Star className="w-3 h-3 fill-amber-400 text-amber-400 shrink-0" />
+                                  )}
+                                  {isPinned && (
+                                    <Pin className="w-3 h-3 fill-[#C8102E] text-[#C8102E] shrink-0" />
+                                  )}
+                                  <span>🎥 فيديو</span>
+                                  <span>•</span>
                                   <span>{msg.time}</span>
                                   {isMe && (
                                     msg.status === 'read' ? (
@@ -2151,139 +2918,335 @@ export default function App() {
                                       <Check className="w-3.5 h-3.5 text-white/80 stroke-[2]" />
                                     )
                                   )}
-                                </span>
+                                </div>
+                              </div>
+                            ) : (
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onContextMenu={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  setActiveMessageActionId(isSelected ? null : msg.id);
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  handleToggleReaction(msg.id, '❤️', e.clientX, e.clientY);
+                                }}
+                                className={`relative px-4 py-2.5 cursor-pointer shadow-xs transition ${
+                                  isMe
+                                    ? 'bg-[#C8102E] text-white rounded-2xl rounded-br-xs'
+                                    : 'bg-white dark:bg-[#1E2738] text-slate-900 dark:text-slate-100 rounded-2xl rounded-bl-xs border border-rose-100/70 dark:border-slate-700/60'
+                                }`}
+                              >
+                                {msg.type === 'text' && (
+                                  <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                                    <FormattedMessageText
+                                      text={msg.text}
+                                      searchQuery={searchQuery}
+                                    />
+                                    <span
+                                      className={`ml-auto flex items-center gap-1 text-[10px] shrink-0 select-none ${
+                                        isMe ? 'text-rose-100/90' : 'text-slate-400'
+                                      }`}
+                                    >
+                                      {isStarred && (
+                                        <Star className="w-3 h-3 fill-amber-400 text-amber-400 shrink-0" />
+                                      )}
+                                      {isPinned && (
+                                        <Pin className="w-3 h-3 fill-rose-300 dark:fill-[#C8102E] shrink-0" />
+                                      )}
+                                      {msg.edited && <span className="italic">معدلة</span>}
+                                      <span>{msg.time}</span>
+                                      {isMe && (
+                                        msg.status === 'read' ? (
+                                          <CheckCheck className="w-3.5 h-3.5 text-white stroke-[2.2]" />
+                                        ) : (
+                                          <Check className="w-3.5 h-3.5 text-white/80 stroke-[2]" />
+                                        )
+                                      )}
+                                    </span>
+                                  </div>
+                                )}
+
+                                {msg.type === 'voice' && (
+                                  <div className="flex items-center gap-2.5 min-w-[210px] sm:min-w-[230px] py-1">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        if (msg.audioDataUrl) {
+                                          if (playingVoiceId === msg.id && activeAudioRef.current) {
+                                            activeAudioRef.current.pause();
+                                            setPlayingVoiceId(null);
+                                            return;
+                                          }
+                                          if (activeAudioRef.current) {
+                                            activeAudioRef.current.pause();
+                                          }
+                                          const audio = new Audio(msg.audioDataUrl);
+                                          audio.playbackRate = voicePlaybackSpeed;
+                                          activeAudioRef.current = audio;
+                                          setPlayingVoiceId(msg.id);
+
+                                          audio.ontimeupdate = () => {
+                                            setAudioProgress((prev) => ({
+                                              ...prev,
+                                              [msg.id]: {
+                                                current: Math.floor(audio.currentTime),
+                                                total: Math.floor(audio.duration || msg.voiceDuration || 3)
+                                              }
+                                            }));
+                                          };
+                                          audio.onended = () => {
+                                            setPlayingVoiceId(null);
+                                            setAudioProgress((prev) => ({
+                                              ...prev,
+                                              [msg.id]: {
+                                                current: 0,
+                                                total: Math.floor(audio.duration || msg.voiceDuration || 3)
+                                              }
+                                            }));
+                                          };
+                                          audio.play().catch(() => {});
+                                        } else {
+                                          setPlayingVoiceId(msg.id);
+                                          playSound('receive');
+                                          setTimeout(() => setPlayingVoiceId(null), 2500);
+                                        }
+                                      }}
+                                      className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 shadow-xs hover:scale-105 transition cursor-pointer ${
+                                        isMe ? 'bg-white text-[#C8102E]' : 'bg-[#C8102E] text-white'
+                                      }`}
+                                    >
+                                      {playingVoiceId === msg.id ? (
+                                        <Pause className="w-4 h-4 fill-current" />
+                                      ) : (
+                                        <Play className="w-4 h-4 fill-current ml-0.5" />
+                                      )}
+                                    </button>
+
+                                    <div className="flex-1">
+                                      <div className="flex items-center gap-0.5 h-5">
+                                        {[30, 65, 45, 90, 50, 75, 40, 85, 95, 55, 70, 35, 60, 40].map(
+                                          (h, idx) => (
+                                            <span
+                                              key={idx}
+                                              style={{ height: `${h}%` }}
+                                              className={`w-1 rounded-full transition-all ${
+                                                isMe ? 'bg-white/80' : 'bg-[#C8102E]/70'
+                                              } ${playingVoiceId === msg.id ? 'animate-pulse' : ''}`}
+                                            />
+                                          )
+                                        )}
+                                      </div>
+                                      <div
+                                        className={`flex items-center justify-between text-[10px] mt-1 ${
+                                          isMe ? 'text-rose-100' : 'text-slate-400'
+                                        }`}
+                                      >
+                                        <span>
+                                          {playingVoiceId === msg.id && audioProgress[msg.id]
+                                            ? `0:0${audioProgress[msg.id].current} / 0:0${audioProgress[msg.id].total}`
+                                            : `0:0${msg.voiceDuration || 3}`}
+                                        </span>
+                                        <div className="flex items-center gap-1.5">
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              cycleVoiceSpeed();
+                                            }}
+                                            className={`px-1.5 py-0.2 rounded-md text-[9px] font-bold border transition ${
+                                              isMe
+                                                ? 'border-white/40 bg-white/15 text-white hover:bg-white/25'
+                                                : 'border-rose-300 dark:border-slate-600 bg-rose-50 dark:bg-slate-700 text-[#C8102E] dark:text-rose-300'
+                                            }`}
+                                            title="تسريع الصوت (مثل واتساب وتيليجرام)"
+                                          >
+                                            {voicePlaybackSpeed}x
+                                          </button>
+                                          {isStarred && (
+                                            <Star className="w-3 h-3 fill-amber-400 text-amber-400 shrink-0" />
+                                          )}
+                                          {isPinned && (
+                                            <Pin className="w-3 h-3 fill-rose-300 dark:fill-[#C8102E] shrink-0" />
+                                          )}
+                                          <span>{msg.time}</span>
+                                          {isMe && (
+                                            msg.status === 'read' ? (
+                                              <CheckCheck className="w-3 h-3 text-white stroke-[2.2]" />
+                                            ) : (
+                                              <Check className="w-3 h-3 text-white/80 stroke-[2]" />
+                                            )
+                                          )}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                             )}
 
-                            {msg.type === 'voice' && (
-                              <div className="flex items-center gap-3 min-w-[190px] py-1">
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (msg.audioDataUrl) {
-                                      const audio = new Audio(msg.audioDataUrl);
-                                      setPlayingVoiceId(msg.id);
-                                      audio.onended = () => setPlayingVoiceId(null);
-                                      audio.play();
-                                    } else {
-                                      setPlayingVoiceId(msg.id);
-                                      playSound('receive');
-                                      setTimeout(() => setPlayingVoiceId(null), 2000);
-                                    }
-                                  }}
-                                  className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 cursor-pointer ${
-                                    isMe
-                                      ? 'bg-white text-[#C8102E]'
-                                      : 'bg-[#C8102E] text-white'
-                                  }`}
-                                >
-                                  {playingVoiceId === msg.id ? (
-                                    <Pause className="w-4 h-4 fill-current" />
-                                  ) : (
-                                    <Play className="w-4 h-4 fill-current ml-0.5" />
-                                  )}
-                                </button>
-                                <div className="flex-1">
-                                  <div className="flex items-center gap-0.5 h-4">
-                                    {[40, 75, 55, 90, 60, 80, 45, 70, 95, 50, 65, 40].map(
-                                      (h, idx) => (
-                                        <span
-                                          key={idx}
-                                          style={{ height: `${h}%` }}
-                                          className={`w-1 rounded-full ${
-                                            isMe ? 'bg-white/80' : 'bg-[#C8102E]/70'
-                                          } ${playingVoiceId === msg.id ? 'animate-pulse' : ''}`}
-                                        />
-                                      )
-                                    )}
-                                  </div>
-                                  <div
-                                    className={`flex justify-between text-[10px] mt-1 ${
-                                      isMe ? 'text-rose-100' : 'text-slate-400'
-                                    }`}
+                            {/* Reactions Badge */}
+                            {msg.reactions && msg.reactions.length > 0 && (
+                              <div
+                                className={`absolute -bottom-2.5 flex items-center gap-0.5 bg-white dark:bg-[#1E2738] px-2 py-0.5 rounded-full shadow-md border border-rose-100 dark:border-slate-700 text-xs z-10 ${
+                                  isMe ? 'right-2' : 'left-2'
+                                }`}
+                              >
+                                {msg.reactions.map((r: string, i: number) => (
+                                  <span key={i}>{r}</span>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Advanced WhatsApp & Telegram Floating Popover Menu */}
+                            {isSelected && (
+                              <div
+                                onClick={(e) => e.stopPropagation()}
+                                className={`absolute z-30 mt-1.5 flex flex-col items-center bg-white dark:bg-[#1E2738] rounded-2xl shadow-2xl border border-rose-100 dark:border-slate-700 p-2 min-w-[220px] ${
+                                  isMe ? 'right-0' : 'left-0'
+                                }`}
+                              >
+                                {/* Quick Reactions row */}
+                                <div className="flex items-center justify-around w-full pb-2 mb-1.5 border-b border-rose-100 dark:border-slate-700">
+                                  {['❤️', '😍', '😂', '🥺', '🔥', '😘'].map((emoji) => (
+                                    <button
+                                      key={emoji}
+                                      onClick={(e) =>
+                                        handleToggleReaction(msg.id, emoji, e.clientX, e.clientY)
+                                      }
+                                      className="hover:scale-125 p-1 transition-transform text-sm cursor-pointer"
+                                    >
+                                      {emoji}
+                                    </button>
+                                  ))}
+                                </div>
+
+                                {/* Telegram & WhatsApp Actions Grid */}
+                                <div className="grid grid-cols-4 gap-1 w-full text-center">
+                                  {/* 1. Reply */}
+                                  <button
+                                    onClick={() => {
+                                      setReplyingTo(msg);
+                                      setActiveMessageActionId(null);
+                                    }}
+                                    className="flex flex-col items-center gap-1 p-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-[10px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                                    title="رد على الرسالة"
                                   >
-                                    <span>0:0{msg.voiceDuration || 3}</span>
-                                    <span>{msg.time} ✓✓</span>
-                                  </div>
+                                    <CornerUpLeft className="w-3.5 h-3.5 text-[#C8102E]" />
+                                    <span>رد</span>
+                                  </button>
+
+                                  {/* 2. Copy (if text) */}
+                                  {msg.type === 'text' && (
+                                    <button
+                                      onClick={() => handleCopyMessage(msg.text)}
+                                      className="flex flex-col items-center gap-1 p-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-[10px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                                      title="نسخ النص"
+                                    >
+                                      <Copy className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                                      <span>نسخ</span>
+                                    </button>
+                                  )}
+
+                                  {/* 3. Star / Unstar */}
+                                  <button
+                                    onClick={() => handleToggleStarMessage(msg.id)}
+                                    className="flex flex-col items-center gap-1 p-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-[10px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                                    title="تمييز بنجمة"
+                                  >
+                                    <Star
+                                      className={`w-3.5 h-3.5 ${
+                                        isStarred
+                                          ? 'fill-amber-400 text-amber-400'
+                                          : 'text-slate-500 dark:text-slate-400'
+                                      }`}
+                                    />
+                                    <span>{isStarred ? 'إلغاء' : 'نجمة'}</span>
+                                  </button>
+
+                                  {/* 4. Pin / Unpin */}
+                                  <button
+                                    onClick={() => handleTogglePinMessage(msg.id)}
+                                    className="flex flex-col items-center gap-1 p-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-[10px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                                    title="تثبيت بأعلى المحادثة"
+                                  >
+                                    <Pin
+                                      className={`w-3.5 h-3.5 ${
+                                        isPinned
+                                          ? 'fill-[#C8102E] text-[#C8102E]'
+                                          : 'text-slate-500 dark:text-slate-400'
+                                      }`}
+                                    />
+                                    <span>{isPinned ? 'إلغاء' : 'تثبيت'}</span>
+                                  </button>
+
+                                  {/* 5. Edit (if isMe & text) */}
+                                  {isMe && msg.type === 'text' && (
+                                    <button
+                                      onClick={() => {
+                                        setEditingMessage(msg);
+                                        setInputText(msg.text);
+                                        setActiveMessageActionId(null);
+                                      }}
+                                      className="flex flex-col items-center gap-1 p-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-[10px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+                                      title="تعديل الرسالة"
+                                    >
+                                      <Edit3 className="w-3.5 h-3.5 text-blue-500" />
+                                      <span>تعديل</span>
+                                    </button>
+                                  )}
+
+                                  {/* 6. Delete */}
+                                  <button
+                                    onClick={() => handleDeleteMessage(msg.id)}
+                                    className="flex flex-col items-center gap-1 p-1.5 hover:bg-red-50 dark:hover:bg-red-950/50 rounded-xl text-[10px] font-medium text-red-500 cursor-pointer"
+                                    title="حذف الرسالة"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                    <span>حذف</span>
+                                  </button>
                                 </div>
                               </div>
                             )}
                           </div>
-                        )}
 
-                        {/* Reactions Badge */}
-                        {msg.reactions && msg.reactions.length > 0 && (
-                          <div
-                            className={`absolute -bottom-2.5 flex items-center gap-0.5 bg-white dark:bg-[#1E2738] px-2 py-0.5 rounded-full shadow-md border border-rose-100 dark:border-slate-700 text-xs z-10 ${
-                              isMe ? 'right-2' : 'left-2'
-                            }`}
-                          >
-                            {msg.reactions.map((r: string, i: number) => (
-                              <span key={i}>{r}</span>
-                            ))}
-                          </div>
-                        )}
-
-                        {/* Floating Popover Action Menu */}
-                        {isSelected && (
-                          <div
-                            onClick={(e) => e.stopPropagation()}
-                            className={`absolute z-30 mt-1.5 flex flex-col items-center bg-white dark:bg-[#1E2738] rounded-2xl shadow-xl border border-rose-100 dark:border-slate-700 p-2 min-w-[180px] ${
-                              isMe ? 'right-0' : 'left-0'
-                            }`}
-                          >
-                            <div className="flex items-center justify-around w-full pb-2 mb-1.5 border-b border-rose-100 dark:border-slate-700">
-                              {['❤️', '😍', '😂', '🥺', '🔥', '😘'].map((emoji) => (
-                                <button
-                                  key={emoji}
-                                  onClick={() => handleToggleReaction(msg.id, emoji)}
-                                  className="hover:scale-125 p-1 transition-transform text-sm cursor-pointer"
-                                >
-                                  {emoji}
-                                </button>
-                              ))}
-                            </div>
-
-                            <div className="flex items-center justify-around w-full gap-1">
-                              {isMe && msg.type === 'text' && (
-                                <button
-                                  onClick={() => {
-                                    setEditingMessage(msg);
-                                    setInputText(msg.text);
-                                    setActiveMessageActionId(null);
-                                  }}
-                                  className="flex flex-col items-center gap-1 px-3 py-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
-                                >
-                                  <Edit3 className="w-4 h-4" />
-                                  <span>Edit</span>
-                                </button>
-                              )}
-
-                              <button
-                                onClick={() => handleDeleteMessage(msg.id)}
-                                className="flex flex-col items-center gap-1 px-3 py-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-xs font-medium text-slate-700 dark:text-slate-200 hover:text-[#C8102E] cursor-pointer"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                                <span>Delete</span>
-                              </button>
-
-                              <button
-                                onClick={() => {
-                                  setReplyingTo(msg);
-                                  setActiveMessageActionId(null);
-                                }}
-                                className="flex flex-col items-center gap-1 px-3 py-1.5 hover:bg-rose-50 dark:hover:bg-slate-800 rounded-xl text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
-                              >
-                                <CornerUpLeft className="w-4 h-4" />
-                                <span>Reply</span>
-                              </button>
-                            </div>
+                        {/* Desktop Quick Actions on Hover (for Partner Messages: right side) */}
+                        {!isMe && (
+                          <div className="hidden sm:flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setReplyingTo(msg);
+                              }}
+                              className="p-1.5 rounded-full hover:bg-rose-100/70 dark:hover:bg-slate-800 text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
+                              title="رد على الرسالة (Double click)"
+                            >
+                              <CornerUpLeft className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActiveMessageActionId(isSelected ? null : msg.id);
+                              }}
+                              className="p-1.5 rounded-full hover:bg-rose-100/70 dark:hover:bg-slate-800 text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
+                              title="تفاعل أو خيارات (Right click)"
+                            >
+                              <Smile className="w-3.5 h-3.5" />
+                            </button>
                           </div>
                         )}
                       </div>
                     </div>
-                  );
-                })}
+                  </React.Fragment>
+                );
+              })}
 
                 <div ref={chatBottomRef} />
               </div>
@@ -2327,77 +3290,108 @@ export default function App() {
                 </div>
               )}
 
-              {/* FLOATING EMOJI PICKER POPOVER */}
-              {showEmojiPicker && (
+              {/* UNIFIED EMOJI & STICKER DRAWER WITH SWITCH BUTTON BAR */}
+              {showMediaDrawer && (
                 <div
                   onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-18 right-4 sm:right-16 w-80 sm:w-88 bg-white dark:bg-[#23272A] rounded-3xl shadow-2xl border border-rose-200/80 dark:border-slate-700 overflow-hidden z-40"
+                  className="absolute bottom-18 right-3 sm:right-12 w-[calc(100vw-24px)] sm:w-96 bg-white/95 dark:bg-[#1E2738]/95 backdrop-blur-md rounded-3xl shadow-2xl border border-rose-200/80 dark:border-slate-700 overflow-hidden z-40 animate-in fade-in zoom-in-95 duration-150"
                 >
-                  <div className="flex items-center justify-between px-3 py-2.5 border-b border-rose-100 dark:border-slate-700/80 bg-rose-50/50 dark:bg-[#1E2124]">
-                    <div className="flex items-center gap-1.5">
-                      {EMOJI_CATEGORIES.map((cat) => (
-                        <button
-                          key={cat.id}
-                          onClick={() => setActiveEmojiCat(cat.id)}
-                          className={`w-8 h-8 rounded-full flex items-center justify-center text-base transition cursor-pointer ${
-                            activeEmojiCat === cat.id
-                              ? 'bg-[#C8102E] text-white shadow-xs scale-105'
-                              : 'hover:bg-rose-100 dark:hover:bg-slate-700'
-                          }`}
-                          title={cat.label}
-                        >
-                          {cat.icon}
-                        </button>
-                      ))}
-                    </div>
-                    <button
-                      onClick={() => setShowEmojiPicker(false)}
-                      className="p-1 text-slate-400 hover:text-[#C8102E]"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  <div className="px-4 pt-2.5 pb-1 flex items-center justify-between">
-                    <span className="text-xs font-semibold text-slate-500 dark:text-slate-300">
-                      {currentCategoryObj.label}
-                    </span>
-                  </div>
-
-                  <div className="p-3 pt-1 max-h-60 overflow-y-auto grid grid-cols-7 gap-1.5 text-2xl">
-                    {currentCategoryObj.emojis.map((emoji, idx) => (
+                  {/* Top Switch Button Bar */}
+                  <div className="flex items-center justify-between p-2.5 border-b border-rose-100 dark:border-slate-700/80 bg-rose-50/70 dark:bg-[#151D2C]">
+                    <div className="flex items-center p-1 rounded-2xl bg-rose-200/50 dark:bg-slate-800/90 gap-1 w-56 sm:w-64">
                       <button
-                        key={idx}
                         type="button"
-                        onClick={() => handleInputChange(inputText + emoji)}
-                        className="w-10 h-10 flex items-center justify-center rounded-xl hover:bg-rose-50 dark:hover:bg-slate-700/60 hover:scale-120 transition-transform cursor-pointer"
+                        onClick={() => setMediaDrawerTab('emojis')}
+                        className={`flex-1 py-1.5 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                          mediaDrawerTab === 'emojis'
+                            ? 'bg-white dark:bg-[#1E2738] text-[#C8102E] dark:text-rose-400 shadow-sm'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                        }`}
                       >
-                        {emoji}
+                        <span>😀</span>
+                        <span>الإيموجي</span>
                       </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* FLOATING CUSTOM STICKER DRAWER POPOVER */}
-              {showStickerPicker && (
-                <div
-                  onClick={(e) => e.stopPropagation()}
-                  className="absolute bottom-18 right-4 sm:right-24 w-80 bg-white dark:bg-[#1E2738] rounded-3xl shadow-2xl border border-rose-200 dark:border-slate-700 p-3.5 z-40"
-                >
-                  <div className="flex items-center justify-between pb-2.5 mb-2.5 border-b border-rose-100 dark:border-slate-700">
-                    <span className="font-bold text-xs text-slate-800 dark:text-white flex items-center gap-1.5">
-                      <Sparkles className="w-4 h-4 text-[#C8102E]" />
-                      <span>ملصقاتنا الخاصة (Stickers)</span>
-                    </span>
-                    <div className="flex items-center gap-1.5">
                       <button
-                        onClick={() => stickerFileInputRef.current?.click()}
-                        className="px-2.5 py-1 rounded-xl bg-[#C8102E] text-white text-[11px] font-semibold flex items-center gap-1 shadow-xs cursor-pointer"
+                        type="button"
+                        onClick={() => setMediaDrawerTab('stickers')}
+                        className={`flex-1 py-1.5 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
+                          mediaDrawerTab === 'stickers'
+                            ? 'bg-white dark:bg-[#1E2738] text-[#C8102E] dark:text-rose-400 shadow-sm'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                        }`}
                       >
-                        <Plus className="w-3.5 h-3.5" />
-                        <span>إضافة ستيكر</span>
+                        <span>💖</span>
+                        <span>الملصقات</span>
+                        <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-rose-100 dark:bg-slate-700 text-[#C8102E] dark:text-rose-300 font-bold">
+                          {stickers.length}
+                        </span>
                       </button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      {mediaDrawerTab === 'stickers' && (
+                        <button
+                          type="button"
+                          onClick={() => stickerFileInputRef.current?.click()}
+                          className="px-2.5 py-1.5 rounded-xl bg-[#C8102E] hover:bg-[#a80d26] text-white text-[11px] font-bold flex items-center gap-1 shadow-xs transition cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">إضافة ستيكر</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setShowMediaDrawer(false)}
+                        className="p-1.5 rounded-full text-slate-400 hover:text-[#C8102E] hover:bg-rose-100/50 dark:hover:bg-slate-800 transition cursor-pointer"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Tab 1: Emoji Picker */}
+                  {mediaDrawerTab === 'emojis' ? (
+                    <div>
+                      {/* Emoji Category Tabs */}
+                      <div className="flex items-center justify-between px-3 py-2 border-b border-rose-100/70 dark:border-slate-800 bg-rose-50/30 dark:bg-[#1A2234]">
+                        <div className="flex items-center gap-1">
+                          {EMOJI_CATEGORIES.map((cat) => (
+                            <button
+                              key={cat.id}
+                              onClick={() => setActiveEmojiCat(cat.id)}
+                              className={`w-8 h-8 rounded-full flex items-center justify-center text-base transition cursor-pointer ${
+                                activeEmojiCat === cat.id
+                                  ? 'bg-[#C8102E] text-white shadow-xs scale-105'
+                                  : 'hover:bg-rose-100 dark:hover:bg-slate-700'
+                              }`}
+                              title={cat.label}
+                            >
+                              {cat.icon}
+                            </button>
+                          ))}
+                        </div>
+                        <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                          {currentCategoryObj.label}
+                        </span>
+                      </div>
+
+                      {/* Emoji Grid */}
+                      <div className="p-3 max-h-60 overflow-y-auto grid grid-cols-7 gap-1.5 text-2xl">
+                        {currentCategoryObj.emojis.map((emoji, idx) => (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => handleInputChange(inputText + emoji)}
+                            className="w-10 h-10 flex items-center justify-center rounded-xl hover:bg-rose-50 dark:hover:bg-slate-700/60 hover:scale-120 transition-transform cursor-pointer"
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    /* Tab 2: Stickers Drawer */
+                    <div className="p-3">
                       <input
                         type="file"
                         ref={stickerFileInputRef}
@@ -2405,30 +3399,23 @@ export default function App() {
                         accept="image/*"
                         className="hidden"
                       />
-                      <button
-                        onClick={() => setShowStickerPicker(false)}
-                        className="p-1 text-slate-400 hover:text-[#C8102E]"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2.5 max-h-60 overflow-y-auto p-1">
-                    {stickers.map((stk, index) => (
-                      <div
-                        key={index}
-                        onClick={() => handleSendMessage('', 'sticker', { stickerUrl: stk })}
-                        className="aspect-square rounded-2xl overflow-hidden border border-rose-100 dark:border-slate-700 bg-rose-50/40 dark:bg-slate-800/60 p-1 cursor-pointer hover:scale-105 hover:border-[#C8102E] transition"
-                      >
-                        <img
-                          src={stk}
-                          alt="Custom Sticker"
-                          className="w-full h-full object-cover rounded-xl"
-                        />
+                      <div className="grid grid-cols-3 gap-2.5 max-h-64 overflow-y-auto p-1">
+                        {stickers.map((stk, index) => (
+                          <div
+                            key={index}
+                            onClick={() => handleSendMessage('', 'sticker', { stickerUrl: stk })}
+                            className="aspect-square rounded-2xl overflow-hidden border border-rose-100 dark:border-slate-700 bg-rose-50/40 dark:bg-slate-800/60 p-1 cursor-pointer hover:scale-105 hover:border-[#C8102E] transition shadow-xs"
+                          >
+                            <img
+                              src={stk}
+                              alt="Custom Sticker"
+                              className="w-full h-full object-cover rounded-xl"
+                            />
+                          </div>
+                        ))}
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2511,17 +3498,23 @@ export default function App() {
                       </div>
                     </div>
                   ) : (
-                    <div className="flex-1 flex items-center gap-2 px-4 py-1.5 rounded-full bg-white dark:bg-[#131B2E] border border-rose-200/80 dark:border-slate-700/80 shadow-xs focus-within:border-[#C8102E] transition">
+                    <div className="flex-1 flex items-center gap-2 px-4 py-1.5 rounded-full bg-white dark:bg-[#131B2E] border border-rose-200/80 dark:border-slate-700/80 shadow-xs focus-within:border-[#C8102E] focus-within:ring-2 focus-within:ring-[#C8102E]/15 transition">
                       <button
                         type="button"
                         onClick={() => {
-                          setShowStickerPicker(!showStickerPicker);
-                          setShowEmojiPicker(false);
+                          if (showMediaDrawer && mediaDrawerTab === 'stickers') {
+                            setShowMediaDrawer(false);
+                          } else {
+                            setMediaDrawerTab('stickers');
+                            setShowMediaDrawer(true);
+                          }
                         }}
-                        className="text-slate-500 dark:text-slate-400 hover:text-[#C8102E] transition cursor-pointer"
-                        title="الملصقات (Stickers)"
+                        className={`text-slate-500 dark:text-slate-400 hover:text-[#C8102E] transition cursor-pointer ${
+                          showMediaDrawer && mediaDrawerTab === 'stickers' ? 'text-[#C8102E]' : ''
+                        }`}
+                        title="الملصقات والإيموجي"
                       >
-                        <Smile className="w-5 h-5" />
+                        <Sparkles className="w-5 h-5" />
                       </button>
 
                       <input
@@ -2570,11 +3563,19 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          setShowEmojiPicker(!showEmojiPicker);
-                          setShowStickerPicker(false);
+                          if (showMediaDrawer && mediaDrawerTab === 'emojis') {
+                            setShowMediaDrawer(false);
+                          } else {
+                            setMediaDrawerTab('emojis');
+                            setShowMediaDrawer(true);
+                          }
                         }}
-                        className="w-7 h-7 rounded-full bg-[#C8102E] text-white flex items-center justify-center hover:scale-105 transition cursor-pointer shrink-0"
-                        title="الإيموجي"
+                        className={`w-7 h-7 rounded-full flex items-center justify-center hover:scale-105 transition cursor-pointer shrink-0 ${
+                          showMediaDrawer && mediaDrawerTab === 'emojis'
+                            ? 'bg-[#a80d26] text-white shadow-md'
+                            : 'bg-[#C8102E] text-white'
+                        }`}
+                        title="الإيموجي والملصقات"
                       >
                         <Smile className="w-4 h-4" />
                       </button>
@@ -2787,6 +3788,332 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             className="max-w-full max-h-[90vh] object-contain rounded-2xl shadow-2xl"
           />
+        </div>
+      )}
+
+      {/* MODAL 4: STARRED ROMANTIC MESSAGES DRAWER */}
+      {showStarredModal && (
+        <div
+          onClick={() => setShowStarredModal(false)}
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg max-h-[85vh] bg-white dark:bg-[#131B2E] rounded-3xl p-5 shadow-2xl border border-rose-200 dark:border-slate-700 flex flex-col"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between pb-3 border-b border-rose-100 dark:border-slate-800 shrink-0">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-amber-50 dark:bg-amber-950/60 text-amber-500 flex items-center justify-center shadow-xs">
+                  <Star className="w-4 h-4 fill-amber-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-slate-900 dark:text-white">
+                    الرسائل المميزة بنجمة ♡
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    أحلى الكلمات والذكريات المحفوظة بينكما ({starredMsgIds.length})
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowStarredModal(false)}
+                className="p-1.5 rounded-full text-slate-400 hover:text-[#C8102E] hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* List */}
+            <div className="flex-1 overflow-y-auto py-3 space-y-2.5">
+              {starredMsgIds.length === 0 ? (
+                <div className="py-12 text-center text-slate-400 space-y-2">
+                  <Star className="w-10 h-10 mx-auto text-slate-300 dark:text-slate-600 stroke-1" />
+                  <p className="text-xs">لم تقم بتمييز أي رسالة بنجمة بعد.</p>
+                  <p className="text-[11px]">
+                    اضغط كليك يمين أو مطولاً على أي رسالة رومانسية واختر "تمييز بنجمة ⭐" لحفظها هنا!
+                  </p>
+                </div>
+              ) : (
+                messages
+                  .filter((m) => starredMsgIds.includes(m.id))
+                  .map((m) => (
+                    <div
+                      key={m.id}
+                      className="p-3.5 rounded-2xl bg-rose-50/50 dark:bg-[#1A2234] border border-rose-100 dark:border-slate-700/80 hover:border-[#C8102E]/40 transition flex items-start justify-between gap-3 group"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-[11px] font-bold text-[#C8102E] dark:text-rose-400">
+                            {profiles[m.senderId]?.name || 'شريكي'}
+                          </span>
+                          <span className="text-[10px] text-slate-400">{m.time}</span>
+                        </div>
+                        {m.type === 'text' && (
+                          <p className="text-xs text-slate-800 dark:text-slate-200 line-clamp-3 leading-relaxed">
+                            {m.text}
+                          </p>
+                        )}
+                        {m.type === 'sticker' && (
+                          <img
+                            src={m.stickerUrl}
+                            alt="Starred media"
+                            className="w-20 h-20 object-cover rounded-xl mt-1 shadow-2xs"
+                          />
+                        )}
+                        {m.type === 'video' && (
+                          <div className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 mt-1">
+                            <Film className="w-4 h-4 text-[#C8102E]" />
+                            <span>مقطع فيديو محفوظ</span>
+                          </div>
+                        )}
+                        {m.type === 'voice' && (
+                          <div className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-300 mt-1">
+                            <Mic className="w-4 h-4 text-[#C8102E]" />
+                            <span>تسجيل صوتي ({m.voiceDuration || 3} ثواني)</span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowStarredModal(false);
+                            jumpToMessage(m.id);
+                          }}
+                          className="px-2.5 py-1.5 rounded-xl bg-white dark:bg-slate-800 hover:bg-[#C8102E] hover:text-white text-slate-600 dark:text-slate-300 text-[11px] font-semibold border border-rose-200/60 dark:border-slate-700 transition cursor-pointer"
+                        >
+                          انتقال
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleToggleStarMessage(m.id)}
+                          className="p-1.5 rounded-xl text-slate-400 hover:text-red-500 hover:bg-rose-100/50 dark:hover:bg-slate-800 transition cursor-pointer"
+                          title="إزالة من المميزة"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 5: SHARED MEDIA & MEMORIES GALLERY */}
+      {showSharedMediaModal && (
+        <div
+          onClick={() => setShowSharedMediaModal(false)}
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-2xl max-h-[85vh] bg-white dark:bg-[#131B2E] rounded-3xl p-5 shadow-2xl border border-rose-200 dark:border-slate-700 flex flex-col"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between pb-3 border-b border-rose-100 dark:border-slate-800 shrink-0">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-rose-50 dark:bg-rose-950/60 text-[#C8102E] flex items-center justify-center">
+                  <Film className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-slate-900 dark:text-white">
+                    معرض الوسائط المشتركة ♡
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    كل الصور والفيديوهات والرسائل الصوتية المتبادلة بينكما
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSharedMediaModal(false)}
+                className="p-1.5 rounded-full text-slate-400 hover:text-[#C8102E] hover:bg-rose-50 dark:hover:bg-slate-800 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Filter Tabs */}
+            <div className="flex items-center gap-2 pt-3 pb-2 border-b border-rose-100/70 dark:border-slate-800 shrink-0">
+              <button
+                type="button"
+                onClick={() => setSharedMediaTab('media')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                  sharedMediaTab === 'media'
+                    ? 'bg-[#C8102E] text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-rose-50 dark:hover:bg-slate-800'
+                }`}
+              >
+                الصور والفيديوهات ({messages.filter((m) => m.type === 'video' || m.type === 'sticker').length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSharedMediaTab('voice')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                  sharedMediaTab === 'voice'
+                    ? 'bg-[#C8102E] text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-rose-50 dark:hover:bg-slate-800'
+                }`}
+              >
+                التسجيلات الصوتية ({messages.filter((m) => m.type === 'voice').length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSharedMediaTab('stickers')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                  sharedMediaTab === 'stickers'
+                    ? 'bg-[#C8102E] text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:bg-rose-50 dark:hover:bg-slate-800'
+                }`}
+              >
+                الملصقات المشتركة ({stickers.length})
+              </button>
+            </div>
+
+            {/* Grid Content */}
+            <div className="flex-1 overflow-y-auto py-3">
+              {sharedMediaTab === 'media' && (
+                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2.5">
+                  {messages
+                    .filter((m) => m.type === 'sticker' || m.type === 'video')
+                    .map((m) => (
+                      <div
+                        key={m.id}
+                        onClick={() => {
+                          if (m.stickerUrl) setLightboxImageUrl(m.stickerUrl);
+                          else if (m.id) {
+                            setShowSharedMediaModal(false);
+                            jumpToMessage(m.id);
+                          }
+                        }}
+                        className="group relative aspect-square rounded-2xl overflow-hidden bg-black/10 dark:bg-slate-800 border border-rose-100 dark:border-slate-700 cursor-pointer shadow-xs hover:scale-102 transition"
+                      >
+                        {m.type === 'video' ? (
+                          <div className="w-full h-full flex flex-col items-center justify-center bg-black/80 text-white">
+                            <Film className="w-8 h-8 text-[#C8102E]" />
+                            <span className="text-[10px] mt-1 font-semibold">فيديو</span>
+                          </div>
+                        ) : (
+                          <img
+                            src={m.stickerUrl}
+                            alt="Shared"
+                            className="w-full h-full object-cover"
+                          />
+                        )}
+                        <span className="absolute bottom-1 right-1 px-1.5 py-0.2 rounded-md bg-black/60 text-white text-[9px] backdrop-blur-xs">
+                          {m.time}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {sharedMediaTab === 'voice' && (
+                <div className="space-y-2">
+                  {messages
+                    .filter((m) => m.type === 'voice')
+                    .map((m) => (
+                      <div
+                        key={m.id}
+                        className="p-3 rounded-2xl bg-rose-50/50 dark:bg-[#1A2234] border border-rose-100 dark:border-slate-700 flex items-center justify-between"
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-8 h-8 rounded-full bg-[#C8102E] text-white flex items-center justify-center">
+                            <Volume2 className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <span className="text-xs font-bold text-slate-800 dark:text-white block">
+                              رسالة صوتية من {profiles[m.senderId]?.name}
+                            </span>
+                            <span className="text-[10px] text-slate-400">
+                              {m.time} • المدة: {m.voiceDuration || 3} ثواني
+                            </span>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowSharedMediaModal(false);
+                            jumpToMessage(m.id);
+                          }}
+                          className="px-3 py-1 rounded-xl bg-white dark:bg-slate-800 text-xs font-semibold text-[#C8102E] dark:text-rose-400 border border-rose-200/60 dark:border-slate-700 hover:bg-[#C8102E] hover:text-white transition cursor-pointer"
+                        >
+                          استماع في الشات
+                        </button>
+                      </div>
+                    ))}
+                </div>
+              )}
+
+              {sharedMediaTab === 'stickers' && (
+                <div className="grid grid-cols-4 sm:grid-cols-5 gap-2.5">
+                  {stickers.map((stk, idx) => (
+                    <div
+                      key={idx}
+                      onClick={() => {
+                        setShowSharedMediaModal(false);
+                        handleSendMessage('', 'sticker', { stickerUrl: stk });
+                      }}
+                      className="aspect-square rounded-2xl overflow-hidden border border-rose-100 dark:border-slate-700 p-1 bg-white dark:bg-slate-800 hover:scale-105 hover:border-[#C8102E] transition cursor-pointer shadow-2xs"
+                    >
+                      <img src={stk} alt="Sticker" className="w-full h-full object-cover rounded-xl" />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SMART SCROLL-TO-BOTTOM FLOATING BUTTON (WhatsApp / Telegram style) */}
+      {showScrollBottom && (
+        <button
+          type="button"
+          onClick={() => {
+            chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+            setNewUnseenCount(0);
+          }}
+          className="fixed bottom-20 right-4 sm:right-8 z-30 w-11 h-11 rounded-full bg-white dark:bg-[#1E2738] text-[#C8102E] dark:text-rose-400 shadow-xl border border-rose-200/80 dark:border-slate-700 flex items-center justify-center hover:scale-110 active:scale-95 transition-all cursor-pointer group"
+          title="الانتقال إلى أحدث رسالة"
+        >
+          <ChevronDown className="w-5 h-5 group-hover:translate-y-0.5 transition-transform" />
+          {newUnseenCount > 0 && (
+            <span className="absolute -top-1.5 -right-1 px-1.5 py-0.2 min-w-[20px] h-[20px] rounded-full bg-[#C8102E] text-white text-[11px] font-bold flex items-center justify-center shadow-md animate-bounce">
+              {newUnseenCount}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* TELEGRAM ANIMATED HEART REACTION PARTICLES */}
+      {floatingParticles.map((p) => (
+        <span
+          key={p.id}
+          className="heart-particle text-xl sm:text-2xl select-none"
+          style={
+            {
+              left: `${p.x}px`,
+              top: `${p.y}px`,
+              '--tx': `${p.tx}px`,
+              '--rot': `${p.rot}deg`
+            } as any
+          }
+        >
+          {p.char}
+        </span>
+      ))}
+
+      {/* SWEET TOAST NOTIFICATION */}
+      {toastMessage && (
+        <div className="fixed top-5 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-2xl bg-slate-900/90 dark:bg-white/95 text-white dark:text-slate-900 text-xs font-semibold shadow-2xl backdrop-blur-md flex items-center gap-2 animate-in fade-in slide-in-from-top-4 duration-200">
+          <Sparkles className="w-4 h-4 text-[#C8102E]" />
+          <span>{toastMessage}</span>
         </div>
       )}
     </div>
